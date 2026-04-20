@@ -8,6 +8,9 @@
       <button class="btn btn-default btn-sm" id="btn-master-health">主库检测</button>
       <button class="btn btn-default btn-sm" id="btn-master-preview">主库修复预览</button>
       <button class="btn btn-default btn-sm" id="btn-master-fix">主库一键修复</button>
+      <label style="margin-left:8px;font-weight:normal;">
+        <input type="checkbox" id="master_fix_auto_restart" style="vertical-align:middle;"> 修复后自动重启MySQL
+      </label>
       <button class="btn btn-default btn-sm" id="btn-master-restart">重启MySQL</button>
       <button class="btn btn-default btn-sm" id="btn-gtid">GTID状态</button>
       <button class="btn btn-default btn-sm" id="btn-overview">总览指标</button>
@@ -174,9 +177,20 @@
     });
     $('#btn-master-fix').on('click', function () {
       bt.confirm({ title: '高危操作', msg: '确认执行主库自动修复？可能修改my.cnf' }, function () {
-        api('master_auto_fix_apply', {}, function (res) {
+        var autoRestart = $('#master_fix_auto_restart').is(':checked') ? '1' : '0';
+        api('master_auto_fix_apply', { auto_restart: autoRestart }, function (res) {
           if (!res.status) return layer.msg(res.msg || '修复失败', { icon: 2 });
-          layer.msg('修复完成，snapshot=' + res.msg.snapshot_id + (res.msg.need_restart ? '，建议重启MySQL' : ''), { icon: 1, time: 6000 });
+          var tail = '';
+          if (res.msg.auto_restart) {
+            if (res.msg.restart_result && res.msg.restart_result.ok) {
+              tail = '，并已自动重启成功';
+            } else if (res.msg.restart_result) {
+              tail = '，自动重启失败: ' + (res.msg.restart_result.err || 'unknown');
+            }
+          } else if (res.msg.need_restart) {
+            tail = '，建议手工重启MySQL';
+          }
+          layer.msg('修复完成，snapshot=' + res.msg.snapshot_id + tail, { icon: 1, time: 7000 });
         });
       });
     });

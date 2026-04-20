@@ -582,9 +582,40 @@ class mysql_multi_source_main:
         data = self._load_config()
         snap = self._create_snapshot(data, "master_auto_fix", {"my_cnf": public.ReadFile(self.mysql_cnf_path) or ""})
         changed = self._apply_master_mycnf_fix()
-        self._audit(data, "master_auto_fix_apply", {"changed": changed, "snapshot_id": snap["snapshot_id"]})
+        auto_restart = False
+        if get is not None and hasattr(get, "auto_restart"):
+            auto_restart = str(get.auto_restart).strip().lower() in ["1", "true", "yes", "on"]
+
+        restart_result = None
+        if changed and auto_restart:
+            out, err = public.ExecShell("/etc/init.d/mysqld restart || systemctl restart mysqld || systemctl restart mysql")
+            restart_ok = not bool((err or "").strip())
+            restart_result = {
+                "ok": restart_ok,
+                "err": (err or "").strip()[:500],
+            }
+
+        self._audit(
+            data,
+            "master_auto_fix_apply",
+            {
+                "changed": changed,
+                "snapshot_id": snap["snapshot_id"],
+                "auto_restart": auto_restart,
+                "restart_result": restart_result,
+            },
+        )
         self._save_config(data)
-        return public.returnMsg(True, {"changed": changed, "snapshot_id": snap["snapshot_id"], "need_restart": changed})
+        return public.returnMsg(
+            True,
+            {
+                "changed": changed,
+                "snapshot_id": snap["snapshot_id"],
+                "need_restart": changed,
+                "auto_restart": auto_restart,
+                "restart_result": restart_result,
+            },
+        )
 
     def master_restart_mysql(self, get=None):
         data = self._load_config()
