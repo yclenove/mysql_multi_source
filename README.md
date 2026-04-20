@@ -45,3 +45,22 @@
 - 新增 `get_gtid_status` GTID 状态检查
 - `channel_status` 支持从 MySQL 实时拉取并刷新状态
 - 前端新增：GTID 检查、来源连通性检查、状态查看
+
+## 阶段三至阶段五进展（已完成）
+
+- 新增库映射能力：
+  - `set_db_mappings`
+  - `list_db_mappings`
+- 新增初始化任务编排能力：
+  - `create_bootstrap_task`
+  - `run_bootstrap_task`
+  - `get_bootstrap_tasks`
+  - `cancel_bootstrap_task`
+- 新增可观测与诊断能力：
+  - `diagnose_source`
+  - `get_source_logs`
+  - `overview_metrics`
+  - `source_detail`
+- 安全增强：
+  - 来源列表中的复制密码脱敏显示
+  - 关键操作写入按来源日志

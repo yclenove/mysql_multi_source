@@ -6,6 +6,7 @@
     <div class="mb10">
       <button class="btn btn-success btn-sm" id="btn-health">健康检查</button>
       <button class="btn btn-default btn-sm" id="btn-gtid">GTID状态</button>
+      <button class="btn btn-default btn-sm" id="btn-overview">总览指标</button>
       <button class="btn btn-default btn-sm" id="btn-refresh">刷新来源</button>
     </div>
 
@@ -18,6 +19,24 @@
       <input class="bt-input-text mr5" style="width: 120px;" id="repl_user" placeholder="复制账号">
       <input class="bt-input-text mr5" style="width: 120px;" id="repl_password" placeholder="复制密码">
       <button class="btn btn-sm btn-success" id="btn-add">添加</button>
+    </div>
+
+    <div class="mb15">
+      <h3 style="margin: 0 0 8px;">库映射配置（JSON）</h3>
+      <input class="bt-input-text mr5" style="width: 140px;" id="mapping_source_id" placeholder="来源ID">
+      <textarea class="bt-input-text" id="mapping_json" style="width: 480px; height: 80px;" placeholder='[{"source_db":"db1","target_db":"m1_db1"}]'></textarea>
+      <button class="btn btn-sm btn-default" id="btn-set-mapping">保存映射</button>
+    </div>
+
+    <div class="mb15">
+      <h3 style="margin: 0 0 8px;">初始化任务</h3>
+      <input class="bt-input-text mr5" style="width: 140px;" id="boot_source_id" placeholder="来源ID">
+      <select class="bt-input-text mr5" id="boot_mode" style="width: 120px;">
+        <option value="physical">physical</option>
+        <option value="logical">logical</option>
+      </select>
+      <button class="btn btn-sm btn-default" id="btn-create-boot">创建任务</button>
+      <button class="btn btn-sm btn-default" id="btn-list-boot">查看任务</button>
     </div>
 
     <table class="table table-hover">
@@ -66,6 +85,8 @@
             '<a href="javascript:;" class="btlink source-stop mr10" data-id="' + item.source_id + '">停止</a>' +
             '<a href="javascript:;" class="btlink source-test mr10" data-id="' + item.source_id + '">连通性</a>' +
             '<a href="javascript:;" class="btlink source-status mr10" data-id="' + item.source_id + '">状态</a>' +
+            '<a href="javascript:;" class="btlink source-diagnose mr10" data-id="' + item.source_id + '">诊断</a>' +
+            '<a href="javascript:;" class="btlink source-log mr10" data-id="' + item.source_id + '">日志</a>' +
             '<a href="javascript:;" class="btlink source-delete" data-id="' + item.source_id + '" style="color:#d9534f;">删除</a>' +
           '</td>' +
           '</tr>';
@@ -94,6 +115,13 @@
     });
 
     $('#btn-refresh').on('click', refreshList);
+    $('#btn-overview').on('click', function () {
+      api('overview_metrics', {}, function (res) {
+        if (!res.status) return layer.msg(res.msg || '总览获取失败', { icon: 2 });
+        var m = res.msg;
+        layer.msg('总数=' + m.total_sources + ', 运行=' + m.running_sources + ', 停止=' + m.stopped_sources + ', 异常=' + m.error_sources + ', 初始化任务=' + m.bootstrap_tasks, { icon: 1, time: 6000 });
+      });
+    });
 
     $('#btn-add').on('click', function () {
       var data = {
@@ -108,6 +136,37 @@
         if (!res.status) return layer.msg(res.msg || '添加失败', { icon: 2 });
         layer.msg('添加成功', { icon: 1 });
         refreshList();
+      });
+    });
+    $('#btn-set-mapping').on('click', function () {
+      var sourceId = $('#mapping_source_id').val();
+      var mappings = $('#mapping_json').val();
+      api('set_db_mappings', { source_id: sourceId, mappings: mappings }, function (res) {
+        if (!res.status) return layer.msg(res.msg || '映射保存失败', { icon: 2 });
+        layer.msg('映射已保存', { icon: 1 });
+      });
+    });
+    $('#btn-create-boot').on('click', function () {
+      var sourceId = $('#boot_source_id').val();
+      var mode = $('#boot_mode').val();
+      api('create_bootstrap_task', { source_id: sourceId, mode: mode }, function (res) {
+        if (!res.status) return layer.msg(res.msg || '创建任务失败', { icon: 2 });
+        var taskId = res.msg.task_id;
+        layer.msg('任务创建成功: ' + taskId, { icon: 1 });
+      });
+    });
+    $('#btn-list-boot').on('click', function () {
+      api('get_bootstrap_tasks', {}, function (res) {
+        if (!res.status) return layer.msg(res.msg || '任务获取失败', { icon: 2 });
+        var text = (res.msg || []).map(function (t) {
+          return t.task_id + ' | ' + t.source_id + ' | ' + t.mode + ' | ' + t.status + ' | ' + t.current_step;
+        }).join('\n');
+        layer.open({
+          type: 1,
+          area: ['800px', '420px'],
+          title: '初始化任务列表',
+          content: '<div style="padding:12px;"><pre style="max-height:360px;overflow:auto;">' + (text || '暂无任务') + '</pre></div>'
+        });
       });
     });
 
@@ -136,6 +195,34 @@
         if (res.msg.last_error) msg += ', 错误=' + res.msg.last_error;
         layer.msg(msg, { icon: res.msg.running ? 1 : 0, time: 5000 });
         refreshList();
+      });
+    });
+    $('.plugin_body').off('click', '.source-diagnose').on('click', '.source-diagnose', function () {
+      api('diagnose_source', { source_id: $(this).data('id') }, function (res) {
+        if (!res.status) return layer.msg(res.msg || '诊断失败', { icon: 2 });
+        var d = res.msg;
+        var tips = (d.suggestions || []).join('\n- ');
+        layer.open({
+          type: 1,
+          area: ['760px', '420px'],
+          title: '诊断结果 - ' + d.source_id,
+          content: '<div style="padding:12px;"><pre>channel: ' + d.channel_name +
+            '\nnetwork_ok: ' + d.network_ok +
+            '\ngtid_enabled: ' + d.gtid_enabled +
+            '\nstatus: ' + JSON.stringify(d.status, null, 2) +
+            '\n建议:\n- ' + tips + '</pre></div>'
+        });
+      });
+    });
+    $('.plugin_body').off('click', '.source-log').on('click', '.source-log', function () {
+      api('get_source_logs', { source_id: $(this).data('id') }, function (res) {
+        if (!res.status) return layer.msg(res.msg || '日志获取失败', { icon: 2 });
+        layer.open({
+          type: 1,
+          area: ['760px', '420px'],
+          title: '来源日志',
+          content: '<div style="padding:12px;"><pre style="max-height:360px;overflow:auto;">' + (res.msg || '暂无日志') + '</pre></div>'
+        });
       });
     });
 

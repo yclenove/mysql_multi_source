@@ -7,6 +7,7 @@ import re
 import socket
 import sys
 import time
+import uuid
 
 if "/www/server/panel/class" not in sys.path:
     sys.path.insert(0, "/www/server/panel/class")
@@ -40,6 +41,20 @@ class mysql_multi_source_main:
     def _query_sql(self, sql):
         mysql_obj = self._mysql()
         return mysql_obj.query(sql)
+
+    def _append_log(self, source_id, message):
+        self._ensure_dirs()
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        log_path = os.path.join(self.log_dir, "{}.log".format(source_id))
+        public.writeFile(log_path, "[{}] {}\n".format(ts, message), "a+")
+
+    def _mask_secret(self, secret):
+        if secret is None:
+            return ""
+        secret = str(secret)
+        if len(secret) <= 4:
+            return "*" * len(secret)
+        return secret[:2] + "*" * (len(secret) - 4) + secret[-2:]
 
     def _get_source_status(self, channel_name):
         safe_channel = self._sql_escape(channel_name)
@@ -96,6 +111,7 @@ class mysql_multi_source_main:
                 "updated_at": self._now(),
             },
             "sources": [],
+            "bootstrap_tasks": [],
         }
 
     def _ensure_dirs(self):
@@ -137,12 +153,29 @@ class mysql_multi_source_main:
                 "plugin": "mysql_multi_source",
                 "version": data.get("version", "1"),
                 "sources_count": len(data.get("sources", [])),
+                "bootstrap_tasks_count": len(data.get("bootstrap_tasks", [])),
             },
         )
 
     def list_sources(self, get=None):
         data = self._load_config()
-        return public.returnMsg(True, data.get("sources", []))
+        result = []
+        for source in data.get("sources", []):
+            item = dict(source)
+            item["repl_password"] = self._mask_secret(item.get("repl_password"))
+            result.append(item)
+        return public.returnMsg(True, result)
+
+    def source_detail(self, get):
+        if not hasattr(get, "source_id"):
+            return public.returnMsg(False, "missing parameter: source_id")
+        data = self._load_config()
+        item = self._find_source(data, str(get.source_id).strip())
+        if not item:
+            return public.returnMsg(False, "source not found")
+        result = dict(item)
+        result["repl_password"] = self._mask_secret(result.get("repl_password"))
+        return public.returnMsg(True, result)
 
     def add_source(self, get):
         required = [
@@ -175,6 +208,7 @@ class mysql_multi_source_main:
             "repl_password": str(get.repl_password).strip(),
             "sync_mode": "gtid",
             "db_mappings": [],
+            "init_strategy": "physical",
             "status": {
                 "running": False,
                 "io_running": "No",
@@ -186,10 +220,11 @@ class mysql_multi_source_main:
             "updated_at": self._now(),
         }
         data["sources"].append(source)
+        self._append_log(source["source_id"], "添加主库来源成功，channel={}".format(source["channel_name"]))
 
         if not self._save_config(data):
             return public.returnMsg(False, "save config failed")
-        return public.returnMsg(True, "source added")
+        return public.returnMsg(True, "来源添加成功")
 
     def test_source_connection(self, get):
         if not hasattr(get, "source_id"):
@@ -222,19 +257,66 @@ class mysql_multi_source_main:
         except Exception as ex:
             return public.returnMsg(False, "读取 GTID 状态失败: {}".format(ex))
 
+    def set_db_mappings(self, get):
+        if not hasattr(get, "source_id"):
+            return public.returnMsg(False, "missing parameter: source_id")
+        if not hasattr(get, "mappings"):
+            return public.returnMsg(False, "missing parameter: mappings")
+
+        data = self._load_config()
+        item = self._find_source(data, str(get.source_id).strip())
+        if not item:
+            return public.returnMsg(False, "source not found")
+
+        try:
+            mappings = get.mappings
+            if isinstance(mappings, str):
+                mappings = json.loads(mappings)
+            if not isinstance(mappings, list):
+                return public.returnMsg(False, "mappings must be a list")
+
+            normalized = []
+            for m in mappings:
+                if not isinstance(m, dict):
+                    return public.returnMsg(False, "mapping item must be object")
+                source_db = str(m.get("source_db", "")).strip()
+                target_db = str(m.get("target_db", "")).strip()
+                if not source_db or not target_db:
+                    return public.returnMsg(False, "source_db and target_db are required")
+                normalized.append({"source_db": source_db, "target_db": target_db})
+            item["db_mappings"] = normalized
+            item["updated_at"] = self._now()
+            self._append_log(item["source_id"], "更新库映射，共{}条".format(len(normalized)))
+            self._save_config(data)
+            return public.returnMsg(True, "库映射更新成功")
+        except Exception as ex:
+            return public.returnMsg(False, "mappings parse failed: {}".format(ex))
+
+    def list_db_mappings(self, get):
+        if not hasattr(get, "source_id"):
+            return public.returnMsg(False, "missing parameter: source_id")
+        data = self._load_config()
+        item = self._find_source(data, str(get.source_id).strip())
+        if not item:
+            return public.returnMsg(False, "source not found")
+        return public.returnMsg(True, item.get("db_mappings", []))
+
     def remove_source(self, get):
         if not hasattr(get, "source_id"):
             return public.returnMsg(False, "missing parameter: source_id")
         source_id = str(get.source_id).strip()
 
         data = self._load_config()
+        item = self._find_source(data, source_id)
         old_len = len(data.get("sources", []))
         data["sources"] = [s for s in data.get("sources", []) if s.get("source_id") != source_id]
         if len(data["sources"]) == old_len:
             return public.returnMsg(False, "source not found")
+        if item:
+            self._append_log(source_id, "删除来源")
         if not self._save_config(data):
             return public.returnMsg(False, "save config failed")
-        return public.returnMsg(True, "source removed")
+        return public.returnMsg(True, "来源已删除")
 
     def start_channel(self, get):
         if not hasattr(get, "source_id"):
@@ -284,8 +366,9 @@ class mysql_multi_source_main:
 
         item["status"] = self._get_source_status(channel_name)
         item["updated_at"] = self._now()
+        self._append_log(item["source_id"], "启动 channel 成功")
         self._save_config(data)
-        return public.returnMsg(True, "channel started")
+        return public.returnMsg(True, "通道启动成功")
 
     def stop_channel(self, get):
         if not hasattr(get, "source_id"):
@@ -310,8 +393,9 @@ class mysql_multi_source_main:
 
         item["status"] = self._get_source_status(channel_name)
         item["updated_at"] = self._now()
+        self._append_log(item["source_id"], "停止 channel")
         self._save_config(data)
-        return public.returnMsg(True, "channel stopped")
+        return public.returnMsg(True, "通道已停止")
 
     def channel_status(self, get):
         if not hasattr(get, "source_id"):
@@ -324,3 +408,167 @@ class mysql_multi_source_main:
         item["updated_at"] = self._now()
         self._save_config(data)
         return public.returnMsg(True, item.get("status", {}))
+
+    def create_bootstrap_task(self, get):
+        if not hasattr(get, "source_id"):
+            return public.returnMsg(False, "missing parameter: source_id")
+        mode = "physical"
+        if hasattr(get, "mode") and str(get.mode).strip():
+            mode = str(get.mode).strip()
+        if mode not in ["physical", "logical"]:
+            return public.returnMsg(False, "mode must be physical or logical")
+
+        data = self._load_config()
+        source = self._find_source(data, str(get.source_id).strip())
+        if not source:
+            return public.returnMsg(False, "source not found")
+        if not source.get("db_mappings"):
+            return public.returnMsg(False, "请先配置库映射后再创建初始化任务")
+
+        task_id = "boot_" + uuid.uuid4().hex[:12]
+        task = {
+            "task_id": task_id,
+            "source_id": source.get("source_id"),
+            "channel_name": source.get("channel_name"),
+            "mode": mode,
+            "status": "pending",
+            "progress": 0,
+            "current_step": "等待执行",
+            "steps": [
+                "源库准备检查",
+                "备份数据",
+                "传输文件",
+                "导入目标",
+                "校验并接管复制",
+            ],
+            "error": "",
+            "created_at": self._now(),
+            "updated_at": self._now(),
+        }
+        data["bootstrap_tasks"].insert(0, task)
+        self._save_config(data)
+        self._append_log(source.get("source_id"), "创建初始化任务: {}, mode={}".format(task_id, mode))
+        return public.returnMsg(True, task)
+
+    def run_bootstrap_task(self, get):
+        if not hasattr(get, "task_id"):
+            return public.returnMsg(False, "missing parameter: task_id")
+        task_id = str(get.task_id).strip()
+        data = self._load_config()
+        task = None
+        for t in data.get("bootstrap_tasks", []):
+            if t.get("task_id") == task_id:
+                task = t
+                break
+        if not task:
+            return public.returnMsg(False, "task not found")
+        if task.get("status") == "done":
+            return public.returnMsg(True, "任务已完成")
+        if task.get("status") == "cancelled":
+            return public.returnMsg(False, "任务已取消")
+
+        task["status"] = "running"
+        task["progress"] = 20
+        task["current_step"] = task["steps"][0]
+        task["updated_at"] = self._now()
+        self._save_config(data)
+
+        # 当前阶段先提供编排能力与留痕；实际备份传输执行在后续任务引擎中接入
+        task["progress"] = 100
+        task["current_step"] = "编排完成（待接入实际执行引擎）"
+        task["status"] = "done"
+        task["updated_at"] = self._now()
+        self._save_config(data)
+        self._append_log(task.get("source_id"), "初始化任务完成(编排): {}".format(task_id))
+        return public.returnMsg(True, task)
+
+    def get_bootstrap_tasks(self, get=None):
+        data = self._load_config()
+        return public.returnMsg(True, data.get("bootstrap_tasks", []))
+
+    def cancel_bootstrap_task(self, get):
+        if not hasattr(get, "task_id"):
+            return public.returnMsg(False, "missing parameter: task_id")
+        task_id = str(get.task_id).strip()
+        data = self._load_config()
+        for task in data.get("bootstrap_tasks", []):
+            if task.get("task_id") == task_id:
+                if task.get("status") == "done":
+                    return public.returnMsg(False, "已完成任务不能取消")
+                task["status"] = "cancelled"
+                task["current_step"] = "用户取消"
+                task["updated_at"] = self._now()
+                self._save_config(data)
+                self._append_log(task.get("source_id"), "取消初始化任务: {}".format(task_id))
+                return public.returnMsg(True, "任务已取消")
+        return public.returnMsg(False, "task not found")
+
+    def diagnose_source(self, get):
+        if not hasattr(get, "source_id"):
+            return public.returnMsg(False, "missing parameter: source_id")
+        data = self._load_config()
+        source = self._find_source(data, str(get.source_id).strip())
+        if not source:
+            return public.returnMsg(False, "source not found")
+
+        status = self._get_source_status(source.get("channel_name"))
+        network_ok = self.test_source_connection(get).get("status", False)
+        gtid_info = self.get_gtid_status().get("msg", {})
+        suggestions = []
+        if not network_ok:
+            suggestions.append("检查主库网络连通性和防火墙白名单")
+        if not gtid_info.get("enabled"):
+            suggestions.append("当前从库 GTID 未开启，建议开启后再使用 GTID 自动定位")
+        if status.get("last_error"):
+            suggestions.append("根据 Last_Error 先处理权限/位点/数据冲突问题")
+        if not source.get("db_mappings"):
+            suggestions.append("建议配置库映射，避免多源同名库冲突")
+        if not suggestions:
+            suggestions.append("当前状态正常，可继续观察复制延迟")
+
+        return public.returnMsg(
+            True,
+            {
+                "source_id": source.get("source_id"),
+                "channel_name": source.get("channel_name"),
+                "status": status,
+                "network_ok": network_ok,
+                "gtid_enabled": gtid_info.get("enabled", False),
+                "suggestions": suggestions,
+            },
+        )
+
+    def get_source_logs(self, get):
+        if not hasattr(get, "source_id"):
+            return public.returnMsg(False, "missing parameter: source_id")
+        source_id = str(get.source_id).strip()
+        log_path = os.path.join(self.log_dir, "{}.log".format(source_id))
+        if not os.path.exists(log_path):
+            return public.returnMsg(True, "")
+        content = public.ReadFile(log_path)
+        return public.returnMsg(True, content or "")
+
+    def overview_metrics(self, get=None):
+        data = self._load_config()
+        total = len(data.get("sources", []))
+        running = 0
+        stopped = 0
+        errors = 0
+        for source in data.get("sources", []):
+            status = self._get_source_status(source.get("channel_name"))
+            if status.get("running"):
+                running += 1
+            else:
+                stopped += 1
+            if status.get("last_error"):
+                errors += 1
+        return public.returnMsg(
+            True,
+            {
+                "total_sources": total,
+                "running_sources": running,
+                "stopped_sources": stopped,
+                "error_sources": errors,
+                "bootstrap_tasks": len(data.get("bootstrap_tasks", [])),
+            },
+        )
