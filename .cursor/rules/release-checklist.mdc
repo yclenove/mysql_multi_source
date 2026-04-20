@@ -1,0 +1,15 @@
+---
+description: Pre-release checklist for mysql_multi_source
+alwaysApply: true
+---
+
+# Release Checklist
+
+- Ensure all channel operations are channel-scoped and tested with at least 2 sources.
+- Verify no plaintext secret is written to logs, config exports, or UI.
+- Verify install/uninstall scripts work on a clean BT panel environment.
+- Verify API methods used by UI exist and return stable response formats.
+- Document new endpoints and behavior changes in `README.md` (Chinese first).
+- Keep design docs, development docs, and development trace logs updated.
+- Confirm stage self-test report is recorded before commit/push.
+- Use Chinese commit message and push after stage acceptance.

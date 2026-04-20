@@ -1,0 +1,36 @@
+---
+description: Core conventions for mysql_multi_source plugin development
+alwaysApply: true
+---
+
+# mysql_multi_source Core Rule
+
+## Communication
+- Default response language is Simplified Chinese.
+- Explanations should be concise, practical, and implementation-oriented.
+- All project documents should use Chinese as the primary language.
+
+## Plugin Structure
+- Keep BT plugin entry files stable: `info.json`, `install.sh`, `index.html`, `mysql_multi_source_main.py`.
+- New backend APIs must follow BT plugin route style: `/plugin?action=a&name=mysql_multi_source&s=<method>`.
+- Backend API responses should use `public.returnMsg(status, msg)` unless a strong reason exists.
+- Keep plugin key name and folder name aligned: `mysql_multi_source`.
+
+## Multi-Source Replication Constraints
+- Design around one slave instance with multiple channels (one source per channel).
+- Any start/stop/reset action must target a specific `channel_name` and avoid global operations.
+- Never overwrite other channels when configuring a single source.
+- Default to GTID mode when possible; only fall back to position mode when explicitly needed.
+
+## Safety and Reliability
+- Prefer additive changes; do not remove existing behavior without explicit approval.
+- Validate required params explicitly before executing SQL or shell commands.
+- Avoid storing plaintext secrets in logs; mask sensitive values in output.
+- For destructive operations (reset channel, remove source), require explicit confirmation in UI.
+
+## Development Workflow
+- After meaningful code changes, run quick lint/diagnostic checks on changed files.
+- Keep commits focused and small; separate refactor from feature behavior changes.
+- Update `README.md` when new API behavior or workflow is introduced.
+- At the end of each development stage: run self-tests, commit, and push.
+- Commit messages must be in Chinese and describe the stage goal and outcome.

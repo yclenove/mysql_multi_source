@@ -1,0 +1,157 @@
+<div class="bt-w-main">
+  <div class="bt-w-menu">
+    <p class="bgw">多源管理</p>
+  </div>
+  <div class="bt-w-con pd15">
+    <div class="mb10">
+      <button class="btn btn-success btn-sm" id="btn-health">健康检查</button>
+      <button class="btn btn-default btn-sm" id="btn-gtid">GTID状态</button>
+      <button class="btn btn-default btn-sm" id="btn-refresh">刷新来源</button>
+    </div>
+
+    <div class="mb15">
+      <h3 style="margin: 0 0 8px;">添加主库来源</h3>
+      <input class="bt-input-text mr5" style="width: 120px;" id="source_id" placeholder="来源ID">
+      <input class="bt-input-text mr5" style="width: 120px;" id="channel_name" placeholder="通道名">
+      <input class="bt-input-text mr5" style="width: 140px;" id="master_host" placeholder="主库地址">
+      <input class="bt-input-text mr5" style="width: 90px;" id="master_port" placeholder="3306" value="3306">
+      <input class="bt-input-text mr5" style="width: 120px;" id="repl_user" placeholder="复制账号">
+      <input class="bt-input-text mr5" style="width: 120px;" id="repl_password" placeholder="复制密码">
+      <button class="btn btn-sm btn-success" id="btn-add">添加</button>
+    </div>
+
+    <table class="table table-hover">
+      <thead>
+        <tr>
+          <th>来源ID</th>
+          <th>通道</th>
+          <th>主库</th>
+          <th>状态</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody id="source_rows">
+        <tr><td colspan="5">暂无数据</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script type="text/javascript">
+  (function () {
+    function api(method, data, cb) {
+      bt_tools.send({
+        url: '/plugin?action=a&name=mysql_multi_source&s=' + method,
+        data: data || {}
+      }, function (res) {
+        cb && cb(res);
+      });
+    }
+
+    function renderRows(list) {
+      var rows = '';
+      if (!list || !list.length) {
+        $('#source_rows').html('<tr><td colspan="5">暂无数据</td></tr>');
+        return;
+      }
+      list.forEach(function (item) {
+        var status = (item.status && item.status.running) ? '运行中' : '已停止';
+        rows += '<tr>' +
+          '<td>' + item.source_id + '</td>' +
+          '<td>' + item.channel_name + '</td>' +
+          '<td>' + item.master_host + ':' + item.master_port + '</td>' +
+          '<td>' + status + '</td>' +
+          '<td>' +
+            '<a href="javascript:;" class="btlink source-start mr10" data-id="' + item.source_id + '">启动</a>' +
+            '<a href="javascript:;" class="btlink source-stop mr10" data-id="' + item.source_id + '">停止</a>' +
+            '<a href="javascript:;" class="btlink source-test mr10" data-id="' + item.source_id + '">连通性</a>' +
+            '<a href="javascript:;" class="btlink source-status mr10" data-id="' + item.source_id + '">状态</a>' +
+            '<a href="javascript:;" class="btlink source-delete" data-id="' + item.source_id + '" style="color:#d9534f;">删除</a>' +
+          '</td>' +
+          '</tr>';
+      });
+      $('#source_rows').html(rows);
+    }
+
+    function refreshList() {
+      api('list_sources', {}, function (res) {
+        if (!res.status) return layer.msg(res.msg || '请求失败', { icon: 2 });
+        renderRows(res.msg || []);
+      });
+    }
+
+    $('#btn-health').on('click', function () {
+      api('health_check', {}, function (res) {
+        if (!res.status) return layer.msg(res.msg || '健康检查失败', { icon: 2 });
+        layer.msg('来源数: ' + (res.msg.sources_count || 0), { icon: 1 });
+      });
+    });
+    $('#btn-gtid').on('click', function () {
+      api('get_gtid_status', {}, function (res) {
+        if (!res.status) return layer.msg(res.msg || 'GTID检查失败', { icon: 2 });
+        layer.msg('GTID模式: ' + res.msg.gtid_mode, { icon: res.msg.enabled ? 1 : 0 });
+      });
+    });
+
+    $('#btn-refresh').on('click', refreshList);
+
+    $('#btn-add').on('click', function () {
+      var data = {
+        source_id: $('#source_id').val(),
+        channel_name: $('#channel_name').val(),
+        master_host: $('#master_host').val(),
+        master_port: $('#master_port').val(),
+        repl_user: $('#repl_user').val(),
+        repl_password: $('#repl_password').val()
+      };
+      api('add_source', data, function (res) {
+        if (!res.status) return layer.msg(res.msg || '添加失败', { icon: 2 });
+        layer.msg('添加成功', { icon: 1 });
+        refreshList();
+      });
+    });
+
+    $('.plugin_body').off('click', '.source-start').on('click', '.source-start', function () {
+      api('start_channel', { source_id: $(this).data('id') }, function (res) {
+        if (!res.status) return layer.msg(res.msg || '启动失败', { icon: 2 });
+        refreshList();
+      });
+    });
+
+    $('.plugin_body').off('click', '.source-stop').on('click', '.source-stop', function () {
+      api('stop_channel', { source_id: $(this).data('id') }, function (res) {
+        if (!res.status) return layer.msg(res.msg || '停止失败', { icon: 2 });
+        refreshList();
+      });
+    });
+    $('.plugin_body').off('click', '.source-test').on('click', '.source-test', function () {
+      api('test_source_connection', { source_id: $(this).data('id') }, function (res) {
+        layer.msg(res.msg || (res.status ? '连通' : '不通'), { icon: res.status ? 1 : 2 });
+      });
+    });
+    $('.plugin_body').off('click', '.source-status').on('click', '.source-status', function () {
+      api('channel_status', { source_id: $(this).data('id') }, function (res) {
+        if (!res.status) return layer.msg(res.msg || '状态获取失败', { icon: 2 });
+        var msg = 'IO=' + res.msg.io_running + ', SQL=' + res.msg.sql_running + ', 延迟=' + res.msg.seconds_behind;
+        if (res.msg.last_error) msg += ', 错误=' + res.msg.last_error;
+        layer.msg(msg, { icon: res.msg.running ? 1 : 0, time: 5000 });
+        refreshList();
+      });
+    });
+
+    $('.plugin_body').off('click', '.source-delete').on('click', '.source-delete', function () {
+      var sourceId = $(this).data('id');
+      bt.confirm({
+        title: '删除来源',
+        msg: '确认删除来源: ' + sourceId + ' ?'
+      }, function () {
+        api('remove_source', { source_id: sourceId }, function (res) {
+          if (!res.status) return layer.msg(res.msg || '删除失败', { icon: 2 });
+          refreshList();
+        });
+      });
+    });
+
+    refreshList();
+  })();
+</script>

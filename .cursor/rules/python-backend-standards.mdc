@@ -1,0 +1,24 @@
+---
+description: Python backend standards for BT plugin APIs
+globs: **/*.py
+alwaysApply: false
+---
+
+# Python Backend Standards
+
+## API Contract
+- Each API method should validate required params first and return clear `public.returnMsg(False, "...")` on failure.
+- Success/failure responses should keep stable shapes to avoid front-end parsing issues.
+
+## SQL and Shell Safety
+- Never build SQL with untrusted raw strings when avoidable.
+- If shell execution is required, validate and sanitize inputs before assembling commands.
+- Avoid global MySQL replication operations without channel targeting.
+
+## Error Handling
+- Use explicit `try/except` around I/O, SQL, and remote calls.
+- Return actionable error messages with context, but never include plaintext passwords/tokens.
+
+## Logging
+- Use structured and concise logs per source/channel.
+- Include `source_id` and `channel_name` in operational logs when available.

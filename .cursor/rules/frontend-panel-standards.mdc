@@ -1,0 +1,23 @@
+---
+description: Frontend standards for BT plugin panel pages
+globs: **/*.html
+alwaysApply: false
+---
+
+# Frontend Panel Standards
+
+## Interaction Design
+- All destructive actions must show a confirmation dialog.
+- Buttons that trigger long-running actions should show progress/disabled state.
+
+## API Usage
+- Call backend endpoints through consistent helper methods.
+- Handle `status=false` branches explicitly and show readable error messages.
+
+## Data Safety
+- Do not render secrets directly in UI.
+- Do not print sensitive payloads in browser console.
+
+## Maintainability
+- Keep functions small and split rendering from event binding logic.
+- Use predictable IDs/class names for source/channel operations.

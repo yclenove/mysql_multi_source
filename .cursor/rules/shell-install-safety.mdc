@@ -1,0 +1,19 @@
+---
+description: Safety rules for install and shell scripts
+globs: **/*.sh
+alwaysApply: false
+---
+
+# Shell Install Safety
+
+## Script Basics
+- Use explicit `install|update|uninstall` branching with clear fallback usage text.
+- Quote variable paths in shell commands to avoid path parsing issues.
+
+## Safety
+- Do not download and execute external scripts during install.
+- Keep uninstall behavior scoped to plugin-owned paths only.
+
+## BT Compatibility
+- Use BT-compatible plugin paths under `/www/server/panel/plugin/<name>`.
+- Keep icon copy paths aligned with BTPanel static icon directory.
