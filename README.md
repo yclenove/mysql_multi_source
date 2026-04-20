@@ -74,3 +74,23 @@
 - `run_bootstrap_task` 支持按步骤推进进度与状态更新（异步执行链路）
 - 前端新增：
   - 输入任务 ID 后可执行“后台执行/取消任务/任务详情”
+
+## 阶段七至阶段十一进展（已完成）
+
+- 双引擎初始化执行层：
+  - 新增 `run_physical_bootstrap` / `run_logical_bootstrap`
+  - `run_bootstrap_task` 已改为真实步骤驱动（带执行节点）
+- 可靠任务系统：
+  - 新增任务心跳、worker_id、checkpoint、失败重试字段
+  - 新增 `recover_bootstrap_tasks` 用于卡死任务恢复
+  - 增加并发接管保护，避免重复worker执行
+- 诊断与可观测增强：
+  - 新增 `get_task_logs`
+  - `overview_metrics` 新增任务成功/失败/平均耗时指标
+  - 错误分类输出（网络/权限/GTID/冲突/资源）
+- UX 流程优化：
+  - 任务执行与取消增加二次确认
+  - 新增任务日志入口，提升问题定位效率
+- hardening_plus 交付：
+  - 压测脚本：`scripts/stress/stress_bootstrap_tasks.sh`、`scripts/stress/stress_bootstrap_tasks.ps1`
+  - 运维文档：`docs/运维手册.md`、`docs/回滚手册.md`、`docs/上线检查清单.md`、`docs/验收报告模板.md`

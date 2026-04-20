@@ -40,6 +40,7 @@
       <button class="btn btn-sm btn-default" id="btn-run-boot">后台执行</button>
       <button class="btn btn-sm btn-default" id="btn-cancel-boot">取消任务</button>
       <button class="btn btn-sm btn-default" id="btn-task-detail">任务详情</button>
+      <button class="btn btn-sm btn-default" id="btn-task-log">任务日志</button>
       <button class="btn btn-sm btn-default" id="btn-list-boot">查看任务</button>
     </div>
 
@@ -175,16 +176,20 @@
     });
     $('#btn-run-boot').on('click', function () {
       var taskId = $('#boot_task_id').val();
-      api('trigger_bootstrap_task', { task_id: taskId }, function (res) {
-        if (!res.status) return layer.msg(res.msg || '触发失败', { icon: 2 });
-        layer.msg('已后台执行', { icon: 1 });
+      bt.confirm({ title: '执行确认', msg: '确认后台执行任务: ' + taskId + ' ?' }, function () {
+        api('trigger_bootstrap_task', { task_id: taskId }, function (res) {
+          if (!res.status) return layer.msg(res.msg || '触发失败', { icon: 2 });
+          layer.msg('已后台执行', { icon: 1 });
+        });
       });
     });
     $('#btn-cancel-boot').on('click', function () {
       var taskId = $('#boot_task_id').val();
-      api('cancel_bootstrap_task', { task_id: taskId }, function (res) {
-        if (!res.status) return layer.msg(res.msg || '取消失败', { icon: 2 });
-        layer.msg('任务已取消', { icon: 1 });
+      bt.confirm({ title: '取消确认', msg: '确认取消任务: ' + taskId + ' ?' }, function () {
+        api('cancel_bootstrap_task', { task_id: taskId }, function (res) {
+          if (!res.status) return layer.msg(res.msg || '取消失败', { icon: 2 });
+          layer.msg('任务已取消', { icon: 1 });
+        });
       });
     });
     $('#btn-task-detail').on('click', function () {
@@ -195,7 +200,19 @@
           type: 1,
           area: ['760px', '420px'],
           title: '任务详情',
-          content: '<div style="padding:12px;"><pre>' + JSON.stringify(res.msg, null, 2) + '</pre></div>'
+          content: '<div style="padding:12px;"><pre>' + JSON.stringify(res.msg, null, 2) + '</pre><div class="mt10">可每5-10秒刷新一次查看进度。</div></div>'
+        });
+      });
+    });
+    $('#btn-task-log').on('click', function () {
+      var taskId = $('#boot_task_id').val();
+      api('get_task_logs', { task_id: taskId }, function (res) {
+        if (!res.status) return layer.msg(res.msg || '获取失败', { icon: 2 });
+        layer.open({
+          type: 1,
+          area: ['760px', '420px'],
+          title: '任务日志',
+          content: '<div style="padding:12px;"><pre style="max-height:360px;overflow:auto;">' + (res.msg || '暂无日志') + '</pre></div>'
         });
       });
     });

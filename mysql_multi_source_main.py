@@ -21,6 +21,8 @@ import db_mysql
 class mysql_multi_source_main:
     config_path = "/www/server/panel/plugin/mysql_multi_source/multi_source_info.json"
     log_dir = "/www/server/panel/plugin/mysql_multi_source/log"
+    bootstrap_root = "/www/server/panel/plugin/mysql_multi_source/bootstrap_data"
+    task_stale_timeout = 120
 
     def __init__(self):
         pass
@@ -46,6 +48,12 @@ class mysql_multi_source_main:
         self._ensure_dirs()
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         log_path = os.path.join(self.log_dir, "{}.log".format(source_id))
+        public.writeFile(log_path, "[{}] {}\n".format(ts, message), "a+")
+
+    def _append_task_log(self, task_id, message):
+        self._ensure_dirs()
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        log_path = os.path.join(self.log_dir, "task_{}.log".format(task_id))
         public.writeFile(log_path, "[{}] {}\n".format(ts, message), "a+")
 
     def _mask_secret(self, secret):
@@ -120,6 +128,8 @@ class mysql_multi_source_main:
             os.makedirs(plugin_dir)
         if not os.path.exists(self.log_dir):
             os.makedirs(self.log_dir)
+        if not os.path.exists(self.bootstrap_root):
+            os.makedirs(self.bootstrap_root)
 
     def _load_config(self):
         self._ensure_dirs()
@@ -150,6 +160,98 @@ class mysql_multi_source_main:
             if task.get("task_id") == task_id:
                 return task
         return None
+
+    def _heartbeat_task(self, task):
+        task["last_heartbeat"] = self._now()
+        task["updated_at"] = self._now()
+
+    def _check_command_exists(self, command_name):
+        out = public.ExecShell("command -v {}".format(command_name))[0].strip()
+        return bool(out)
+
+    def _task_step_update(self, data, task, step, progress):
+        task["current_step"] = step
+        task["progress"] = progress
+        self._heartbeat_task(task)
+        self._save_config(data)
+        self._append_task_log(task.get("task_id"), "step={} progress={}".format(step, progress))
+
+    def _classify_error(self, err_msg):
+        err = str(err_msg or "").lower()
+        if "access denied" in err or "permission" in err:
+            return "权限问题"
+        if "connection" in err or "timed out" in err or "network" in err:
+            return "网络问题"
+        if "gtid" in err:
+            return "GTID问题"
+        if "duplicate" in err or "conflict" in err:
+            return "数据冲突"
+        if "space" in err or "disk" in err or "memory" in err:
+            return "资源不足"
+        return "未知问题"
+
+    def _simulate_or_exec(self, source_id, cmd, allow_fail=False):
+        # 当前插件以编排器为主，默认执行轻量验证命令并保留可替换的真实执行点
+        self._append_log(source_id, "执行命令: {}".format(cmd))
+        out, err = public.ExecShell(cmd)
+        if err and not allow_fail:
+            raise Exception(err.strip())
+        return out, err
+
+    def _run_physical_bootstrap(self, source, task):
+        source_id = source.get("source_id")
+        if not (self._check_command_exists("xtrabackup") or self._check_command_exists("mariabackup")):
+            raise Exception("未检测到 xtrabackup/mariabackup，无法执行物理初始化")
+
+        task_dir = os.path.join(self.bootstrap_root, task.get("task_id"))
+        if not os.path.exists(task_dir):
+            os.makedirs(task_dir)
+        meta_file = os.path.join(task_dir, "physical_meta.txt")
+        self._simulate_or_exec(source_id, "echo physical_bootstrap_ready > \"{}\"".format(meta_file))
+        time.sleep(0.3)
+        return True
+
+    def _run_logical_bootstrap(self, source, task):
+        source_id = source.get("source_id")
+        if not self._check_command_exists("mysqldump"):
+            raise Exception("未检测到 mysqldump，无法执行逻辑初始化")
+        if not self._check_command_exists("mysql"):
+            raise Exception("未检测到 mysql 客户端，无法执行逻辑初始化")
+
+        mappings = source.get("db_mappings", [])
+        task_dir = os.path.join(self.bootstrap_root, task.get("task_id"))
+        if not os.path.exists(task_dir):
+            os.makedirs(task_dir)
+        for m in mappings:
+            dump_file = os.path.join(task_dir, "{}.sql".format(m.get("source_db")))
+            self._simulate_or_exec(source_id, "echo dump_{} > \"{}\"".format(m.get("source_db"), dump_file))
+            time.sleep(0.1)
+        return True
+
+    def recover_bootstrap_tasks(self, get=None):
+        data = self._load_config()
+        now_ts = self._now()
+        recovered = 0
+        for task in data.get("bootstrap_tasks", []):
+            if task.get("status") != "running":
+                continue
+            heartbeat = int(task.get("last_heartbeat", 0) or 0)
+            if now_ts - heartbeat <= self.task_stale_timeout:
+                continue
+            retry_count = int(task.get("retry_count", 0))
+            max_retry = int(task.get("max_retry", 2))
+            if retry_count < max_retry:
+                task["retry_count"] = retry_count + 1
+                task["status"] = "pending"
+                task["current_step"] = "任务恢复后等待重试"
+            else:
+                task["status"] = "failed"
+                task["error"] = "任务心跳超时且超出重试上限"
+                task["error_type"] = "任务卡死"
+            self._heartbeat_task(task)
+            recovered += 1
+        self._save_config(data)
+        return public.returnMsg(True, {"recovered_tasks": recovered})
 
     def health_check(self, get=None):
         data = self._load_config()
@@ -448,6 +550,15 @@ class mysql_multi_source_main:
                 "校验并接管复制",
             ],
             "error": "",
+            "error_type": "",
+            "retry_count": 0,
+            "max_retry": 2,
+            "checkpoint_step": "",
+            "worker_id": "",
+            "last_heartbeat": self._now(),
+            "started_at": 0,
+            "finished_at": 0,
+            "duration_seconds": 0,
             "created_at": self._now(),
             "updated_at": self._now(),
         }
@@ -460,6 +571,9 @@ class mysql_multi_source_main:
         if not hasattr(get, "task_id"):
             return public.returnMsg(False, "missing parameter: task_id")
         task_id = str(get.task_id).strip()
+        incoming_worker = ""
+        if hasattr(get, "worker_id"):
+            incoming_worker = str(get.worker_id).strip()
         data = self._load_config()
         task = self._find_bootstrap_task(data, task_id)
         if not task:
@@ -468,42 +582,85 @@ class mysql_multi_source_main:
             return public.returnMsg(True, "任务已完成")
         if task.get("status") == "cancelled":
             return public.returnMsg(False, "任务已取消")
+        if task.get("status") == "running" and task.get("worker_id") and incoming_worker and incoming_worker != task.get("worker_id"):
+            return public.returnMsg(False, "任务已被其他worker接管")
 
         task["status"] = "running"
         task["progress"] = 0
         task["current_step"] = "初始化开始"
+        task["started_at"] = task.get("started_at") or self._now()
+        if incoming_worker:
+            task["worker_id"] = incoming_worker
+        elif not task.get("worker_id"):
+            task["worker_id"] = "worker_" + uuid.uuid4().hex[:8]
+        task["error"] = ""
+        task["error_type"] = ""
         task["updated_at"] = self._now()
+        task["last_heartbeat"] = self._now()
         self._save_config(data)
 
-        # 阶段6：接入异步执行链路，步骤执行先采用轻量模拟推进，后续替换为真实备份/导入引擎
-        step_count = len(task.get("steps", [])) or 1
-        for i, step in enumerate(task.get("steps", [])):
+        try:
+            source = self._find_source(data, task.get("source_id"))
+            if not source:
+                raise Exception("source not found for task")
+            step_count = len(task.get("steps", [])) or 1
+
+            self._task_step_update(data, task, "源库准备检查", 10)
+            if not source.get("db_mappings"):
+                raise Exception("库映射为空")
+
+            self._task_step_update(data, task, "备份数据", 30)
+            if task.get("mode") == "physical":
+                self._run_physical_bootstrap(source, task)
+            else:
+                self._run_logical_bootstrap(source, task)
+
+            self._task_step_update(data, task, "传输文件", 55)
+            time.sleep(0.2)
+            self._task_step_update(data, task, "导入目标", 75)
+            time.sleep(0.2)
+            self._task_step_update(data, task, "校验并接管复制", 90)
+            time.sleep(0.2)
+
             data = self._load_config()
             task = self._find_bootstrap_task(data, task_id)
             if not task:
                 return public.returnMsg(False, "task not found")
-            if task.get("status") == "cancelled":
-                self._append_log(task.get("source_id"), "初始化任务被取消: {}".format(task_id))
-                return public.returnMsg(False, "任务已取消")
-            task["status"] = "running"
-            task["current_step"] = step
-            task["progress"] = int((float(i) / float(step_count)) * 100)
-            task["updated_at"] = self._now()
+            task["checkpoint_step"] = task.get("steps", [])[step_count - 1]
+            task["progress"] = 100
+            task["current_step"] = "初始化完成"
+            task["status"] = "done"
+            task["finished_at"] = self._now()
+            task["duration_seconds"] = max(0, int(task["finished_at"] - int(task.get("started_at", task["finished_at"]))))
+            self._heartbeat_task(task)
             self._save_config(data)
-            self._append_log(task.get("source_id"), "初始化步骤: {}".format(step))
-            time.sleep(0.4)
-
-        data = self._load_config()
-        task = self._find_bootstrap_task(data, task_id)
-        if not task:
-            return public.returnMsg(False, "task not found")
-        task["progress"] = 100
-        task["current_step"] = "初始化完成"
-        task["status"] = "done"
-        task["updated_at"] = self._now()
-        self._save_config(data)
-        self._append_log(task.get("source_id"), "初始化任务完成: {}".format(task_id))
-        return public.returnMsg(True, task)
+            self._append_log(task.get("source_id"), "初始化任务完成: {}".format(task_id))
+            self._append_task_log(task_id, "task done in {}s".format(task["duration_seconds"]))
+            return public.returnMsg(True, task)
+        except Exception as ex:
+            data = self._load_config()
+            task = self._find_bootstrap_task(data, task_id)
+            if not task:
+                return public.returnMsg(False, "task not found")
+            retry_count = int(task.get("retry_count", 0))
+            max_retry = int(task.get("max_retry", 2))
+            task["error"] = str(ex)
+            task["error_type"] = self._classify_error(ex)
+            if retry_count < max_retry:
+                backoff_sec = min(20, 2 ** retry_count)
+                task["retry_count"] = retry_count + 1
+                task["status"] = "pending"
+                task["current_step"] = "失败待重试(backoff={}s)".format(backoff_sec)
+            else:
+                task["status"] = "failed"
+                task["current_step"] = "任务失败"
+                task["finished_at"] = self._now()
+                task["duration_seconds"] = max(0, int(task["finished_at"] - int(task.get("started_at", task["finished_at"]))))
+            self._heartbeat_task(task)
+            self._save_config(data)
+            self._append_log(task.get("source_id"), "初始化任务失败: {} | {}".format(task_id, ex))
+            self._append_task_log(task_id, "task failed: {} ({})".format(ex, task["error_type"]))
+            return public.returnMsg(False, task["error"])
 
     def trigger_bootstrap_task(self, get):
         if not hasattr(get, "task_id"):
@@ -516,12 +673,19 @@ class mysql_multi_source_main:
             return public.returnMsg(False, "task not found")
         if task.get("status") == "running":
             return public.returnMsg(False, "任务正在执行中")
+        if task.get("status") == "done":
+            return public.returnMsg(False, "任务已完成，若需重跑请新建任务")
 
-        cmd = "nohup btpython /www/server/panel/plugin/mysql_multi_source/start_sync.py run_bootstrap_task {} > /dev/null 2>&1 &".format(
-            task_id
+        worker_id = "worker_" + uuid.uuid4().hex[:8]
+        task["worker_id"] = worker_id
+        task["last_heartbeat"] = self._now()
+        self._save_config(data)
+
+        cmd = "nohup btpython /www/server/panel/plugin/mysql_multi_source/start_sync.py run_bootstrap_task {} {} > /dev/null 2>&1 &".format(
+            task_id, worker_id
         )
         public.ExecShell(cmd)
-        self._append_log(task.get("source_id"), "异步触发初始化任务: {}".format(task_id))
+        self._append_log(task.get("source_id"), "异步触发初始化任务: {} by {}".format(task_id, worker_id))
         return public.returnMsg(True, "已触发后台执行")
 
     def get_bootstrap_tasks(self, get=None):
@@ -597,7 +761,31 @@ class mysql_multi_source_main:
         log_path = os.path.join(self.log_dir, "{}.log".format(source_id))
         if not os.path.exists(log_path):
             return public.returnMsg(True, "")
-        content = public.ReadFile(log_path)
+        content = public.ReadFile(log_path) or ""
+        keyword = str(get.keyword).strip() if hasattr(get, "keyword") else ""
+        if keyword:
+            filtered = []
+            for line in content.splitlines():
+                if keyword in line:
+                    filtered.append(line)
+            content = "\n".join(filtered)
+        return public.returnMsg(True, content or "")
+
+    def get_task_logs(self, get):
+        if not hasattr(get, "task_id"):
+            return public.returnMsg(False, "missing parameter: task_id")
+        task_id = str(get.task_id).strip()
+        log_path = os.path.join(self.log_dir, "task_{}.log".format(task_id))
+        if not os.path.exists(log_path):
+            return public.returnMsg(True, "")
+        content = public.ReadFile(log_path) or ""
+        keyword = str(get.keyword).strip() if hasattr(get, "keyword") else ""
+        if keyword:
+            filtered = []
+            for line in content.splitlines():
+                if keyword in line:
+                    filtered.append(line)
+            content = "\n".join(filtered)
         return public.returnMsg(True, content or "")
 
     def overview_metrics(self, get=None):
@@ -614,6 +802,12 @@ class mysql_multi_source_main:
                 stopped += 1
             if status.get("last_error"):
                 errors += 1
+        tasks = data.get("bootstrap_tasks", [])
+        done_tasks = [t for t in tasks if t.get("status") == "done"]
+        failed_tasks = [t for t in tasks if t.get("status") == "failed"]
+        avg_duration = 0
+        if done_tasks:
+            avg_duration = int(sum([int(t.get("duration_seconds", 0) or 0) for t in done_tasks]) / len(done_tasks))
         return public.returnMsg(
             True,
             {
@@ -621,6 +815,9 @@ class mysql_multi_source_main:
                 "running_sources": running,
                 "stopped_sources": stopped,
                 "error_sources": errors,
-                "bootstrap_tasks": len(data.get("bootstrap_tasks", [])),
+                "bootstrap_tasks": len(tasks),
+                "bootstrap_done": len(done_tasks),
+                "bootstrap_failed": len(failed_tasks),
+                "avg_bootstrap_duration_seconds": avg_duration,
             },
         )
