@@ -21,6 +21,15 @@
     </div>
 
     <div class="mb15">
+      <h3 style="margin: 0 0 8px;">主库自动修复增强（含复制账号）</h3>
+      <input class="bt-input-text mr5" style="width: 120px;" id="master_repl_user" placeholder="repl_user" value="repl_user">
+      <input class="bt-input-text mr5" style="width: 130px;" id="master_repl_password" placeholder="repl_password">
+      <input class="bt-input-text mr5" style="width: 120px;" id="master_replica_host" placeholder="replica_host" value="%">
+      <button class="btn btn-sm btn-default" id="btn-master-create-user">仅创建复制账号</button>
+      <button class="btn btn-sm btn-default" id="btn-master-connect-test">连接测试向导</button>
+    </div>
+
+    <div class="mb15">
       <h3 style="margin: 0 0 8px;">添加主库来源</h3>
       <input class="bt-input-text mr5" style="width: 120px;" id="source_id" placeholder="来源ID">
       <input class="bt-input-text mr5" style="width: 120px;" id="channel_name" placeholder="通道名">
@@ -52,10 +61,26 @@
     </div>
 
     <div class="mb15">
-      <h3 style="margin: 0 0 8px;">库映射配置（JSON）</h3>
+      <h3 style="margin: 0 0 8px;">库映射配置</h3>
+      <p class="muted" style="color:#888;font-size:12px;margin:0 0 8px;">填写「主库库名 → 从库目标库名」即可，无需手写 JSON；高级用户可展开 JSON 查看。</p>
       <input class="bt-input-text mr5" style="width: 140px;" id="mapping_source_id" placeholder="来源ID">
-      <textarea class="bt-input-text" id="mapping_json" style="width: 480px; height: 80px;" placeholder='[{"source_db":"db1","target_db":"m1_db1"}]'></textarea>
-      <button class="btn btn-sm btn-default" id="btn-set-mapping">保存映射</button>
+      <button class="btn btn-sm btn-default" id="btn-load-mapping">载入已有映射</button>
+      <button class="btn btn-sm btn-default" id="btn-add-mapping-row">添加一行</button>
+      <button class="btn btn-sm btn-success" id="btn-set-mapping">保存映射</button>
+      <table class="table table-hover" style="max-width:640px;margin-top:10px;">
+        <thead>
+          <tr>
+            <th>主库库名（source_db）</th>
+            <th>从库目标库名（target_db）</th>
+            <th style="width:70px;">操作</th>
+          </tr>
+        </thead>
+        <tbody id="mapping_rows"></tbody>
+      </table>
+      <details style="margin-top:8px;">
+        <summary style="cursor:pointer;color:#666;">高级：JSON 预览（只读，保存时自动生成）</summary>
+        <textarea class="bt-input-text" id="mapping_json" readonly style="width: 640px; height: 72px; margin-top:6px; background:#fafafa;" placeholder="[]"></textarea>
+      </details>
     </div>
 
     <div class="mb15">
@@ -82,7 +107,22 @@
         <option value="mariabackup">mariabackup</option>
       </select>
       <button class="btn btn-sm btn-default" id="btn-install-tool">一键安装</button>
+      <button class="btn btn-sm btn-default" id="btn-install-tool-retry">安装重试</button>
+      <button class="btn btn-sm btn-default" id="btn-copy-tool-cmd">复制安装命令</button>
       <button class="btn btn-sm btn-default" id="btn-tool-log">安装日志</button>
+    </div>
+
+    <div class="mb15">
+      <h3 style="margin: 0 0 8px;">压测向导（UI）</h3>
+      <input class="bt-input-text mr5" style="width: 120px;" id="stress_source_count" placeholder="来源数" value="1">
+      <input class="bt-input-text mr5" style="width: 120px;" id="stress_task_per_source" placeholder="每来源任务数" value="2">
+      <select class="bt-input-text mr5" id="stress_mode" style="width: 120px;">
+        <option value="auto">auto</option>
+        <option value="logical">logical</option>
+        <option value="physical">physical</option>
+      </select>
+      <button class="btn btn-sm btn-default" id="btn-stress-run">开始压测</button>
+      <button class="btn btn-sm btn-default" id="btn-stress-report">查看压测报告</button>
     </div>
 
     <table class="table table-hover">
@@ -112,6 +152,77 @@
         cb && cb(res);
       });
     }
+
+    function collectMappingsFromForm() {
+      var list = [];
+      $('#mapping_rows tr').each(function () {
+        var s = ($(this).find('.mapping-source-db').val() || '').trim();
+        var t = ($(this).find('.mapping-target-db').val() || '').trim();
+        if (s && t) {
+          list.push({ source_db: s, target_db: t });
+        }
+      });
+      return list;
+    }
+
+    function syncMappingJsonPreview() {
+      $('#mapping_json').val(JSON.stringify(collectMappingsFromForm(), null, 0));
+    }
+
+    function appendMappingRow(sourceDb, targetDb) {
+      var tr = $(
+        '<tr>' +
+          '<td><input type="text" class="bt-input-text mapping-source-db" style="width:200px;" placeholder="例如 order_db" value="' +
+          (sourceDb ? $('<div/>').text(sourceDb).html() : '') + '"></td>' +
+          '<td><input type="text" class="bt-input-text mapping-target-db" style="width:200px;" placeholder="例如 m1_order_db" value="' +
+          (targetDb ? $('<div/>').text(targetDb).html() : '') + '"></td>' +
+          '<td><a href="javascript:;" class="btlink mapping-remove-row">删除</a></td>' +
+        '</tr>'
+      );
+      $('#mapping_rows').append(tr);
+    }
+
+    function ensureMappingRowsInitialized() {
+      if ($('#mapping_rows tr').length === 0) {
+        appendMappingRow('', '');
+      }
+    }
+
+    $('#mapping_rows').on('input change', '.mapping-source-db, .mapping-target-db', syncMappingJsonPreview);
+    $('#mapping_rows').on('click', '.mapping-remove-row', function () {
+      var tr = $(this).closest('tr');
+      if ($('#mapping_rows tr').length <= 1) {
+        tr.find('.mapping-source-db,.mapping-target-db').val('');
+        syncMappingJsonPreview();
+        return;
+      }
+      tr.remove();
+      syncMappingJsonPreview();
+    });
+
+    $('#btn-add-mapping-row').on('click', function () {
+      appendMappingRow('', '');
+      syncMappingJsonPreview();
+    });
+
+    $('#btn-load-mapping').on('click', function () {
+      var sourceId = $('#mapping_source_id').val();
+      if (!sourceId) return layer.msg('请先填写来源ID', { icon: 0 });
+      api('list_db_mappings', { source_id: sourceId }, function (res) {
+        if (!res.status) return layer.msg(res.msg || '载入失败', { icon: 2 });
+        $('#mapping_rows').empty();
+        var arr = res.msg || [];
+        if (!arr.length) {
+          appendMappingRow('', '');
+        } else {
+          arr.forEach(function (m) {
+            appendMappingRow(m.source_db || '', m.target_db || '');
+          });
+        }
+        syncMappingJsonPreview();
+        layer.msg('已载入 ' + arr.length + ' 条映射', { icon: 1 });
+      });
+    });
 
     function renderRows(list) {
       var rows = '';
@@ -178,7 +289,12 @@
     $('#btn-master-fix').on('click', function () {
       bt.confirm({ title: '高危操作', msg: '确认执行主库自动修复？可能修改my.cnf' }, function () {
         var autoRestart = $('#master_fix_auto_restart').is(':checked') ? '1' : '0';
-        api('master_auto_fix_apply', { auto_restart: autoRestart }, function (res) {
+        api('master_auto_fix_apply', {
+          auto_restart: autoRestart,
+          repl_user: $('#master_repl_user').val(),
+          repl_password: $('#master_repl_password').val(),
+          replica_host: $('#master_replica_host').val()
+        }, function (res) {
           if (!res.status) return layer.msg(res.msg || '修复失败', { icon: 2 });
           var tail = '';
           if (res.msg.auto_restart) {
@@ -192,6 +308,30 @@
           }
           layer.msg('修复完成，snapshot=' + res.msg.snapshot_id + tail, { icon: 1, time: 7000 });
         });
+      });
+    });
+    $('#btn-master-create-user').on('click', function () {
+      api('master_create_repl_user', {
+        repl_user: $('#master_repl_user').val(),
+        repl_password: $('#master_repl_password').val(),
+        replica_host: $('#master_replica_host').val()
+      }, function (res) {
+        if (!res.status) return layer.msg(res.msg || '创建失败', { icon: 2 });
+        layer.msg(res.msg || '创建成功', { icon: 1 });
+      });
+    });
+    $('#btn-master-connect-test').on('click', function () {
+      api('test_master_connection_direct', {
+        master_host: $('#master_host').val() || $('#pf_master_host').val(),
+        master_port: $('#master_port').val() || $('#pf_master_port').val() || '3306',
+        repl_user: $('#master_repl_user').val() || $('#repl_user').val(),
+        repl_password: $('#master_repl_password').val() || $('#repl_password').val()
+      }, function (res) {
+        if (!res.status) {
+          var r = res.msg || {};
+          return layer.msg((r.msg || '连接失败') + ' [' + (r.reason || 'unknown') + ']', { icon: 2, time: 5000 });
+        }
+        layer.msg((res.msg.msg || '连接成功') + ' [' + (res.msg.reason || 'ok') + ']', { icon: 1, time: 5000 });
       });
     });
     $('#btn-master-restart').on('click', function () {
@@ -266,13 +406,17 @@
     });
     $('#btn-set-mapping').on('click', function () {
       var sourceId = $('#mapping_source_id').val();
-      var mappings = $('#mapping_json').val();
-      api('set_db_mappings', { source_id: sourceId, mappings: mappings }, function (res) {
+      if (!sourceId) return layer.msg('请先填写来源ID', { icon: 0 });
+      syncMappingJsonPreview();
+      var list = collectMappingsFromForm();
+      if (!list.length) return layer.msg('请至少填写一行「主库库名」与「从库目标库名」', { icon: 0 });
+      api('set_db_mappings', { source_id: sourceId, mappings: JSON.stringify(list) }, function (res) {
         if (!res.status) return layer.msg(res.msg || '映射保存失败', { icon: 2 });
         layer.msg('映射已保存', { icon: 1 });
       });
     });
     $('#btn-export-profile').on('click', function () {
+      syncMappingJsonPreview();
       var data = {
         source_id: $('#pf_source_id').val(),
         channel_name: $('#pf_channel_name').val(),
@@ -280,7 +424,7 @@
         master_port: $('#pf_master_port').val(),
         repl_user: $('#pf_repl_user').val(),
         repl_password: $('#pf_repl_password').val(),
-        db_mappings: $('#mapping_json').val()
+        db_mappings: $('#mapping_json').val() || '[]'
       };
       api('master_export_signed_profile', data, function (res) {
         if (!res.status) return layer.msg(res.msg || '导出失败', { icon: 2 });
@@ -407,6 +551,27 @@
         });
       });
     });
+    $('#btn-install-tool-retry').on('click', function () {
+      var toolName = $('#tool_name').val();
+      bt.confirm({ title: '重试确认', msg: '确认重试安装工具: ' + toolName + ' ?' }, function () {
+        api('install_bootstrap_tool', { tool_name: toolName, retry: '1' }, function (res) {
+          if (res.status) return layer.msg('重试安装成功', { icon: 1 });
+          layer.msg((res.msg && res.msg.msg) || res.msg || '重试失败', { icon: 2 });
+        });
+      });
+    });
+    $('#btn-copy-tool-cmd').on('click', function () {
+      var toolName = $('#tool_name').val();
+      api('get_tool_install_command', { tool_name: toolName }, function (res) {
+        if (!res.status) return layer.msg(res.msg || '获取失败', { icon: 2 });
+        layer.open({
+          type: 1,
+          area: ['760px', '280px'],
+          title: '安装命令（可复制）',
+          content: '<div style="padding:12px;"><pre>' + res.msg.command + '</pre></div>'
+        });
+      });
+    });
     $('#btn-tool-log').on('click', function () {
       api('get_tool_install_log', {}, function (res) {
         if (!res.status) return layer.msg(res.msg || '获取失败', { icon: 2 });
@@ -415,6 +580,27 @@
           area: ['760px', '420px'],
           title: '工具安装日志',
           content: '<div style="padding:12px;"><pre style="max-height:360px;overflow:auto;">' + (res.msg || '暂无日志') + '</pre></div>'
+        });
+      });
+    });
+    $('#btn-stress-run').on('click', function () {
+      api('run_stress_wizard', {
+        source_count: $('#stress_source_count').val(),
+        task_per_source: $('#stress_task_per_source').val(),
+        mode: $('#stress_mode').val()
+      }, function (res) {
+        if (!res.status) return layer.msg(res.msg || '压测启动失败', { icon: 2 });
+        layer.msg('压测已启动，创建任务=' + res.msg.created + ', 失败=' + res.msg.failed, { icon: 1, time: 6000 });
+      });
+    });
+    $('#btn-stress-report').on('click', function () {
+      api('get_stress_report', {}, function (res) {
+        if (!res.status) return layer.msg(res.msg || '获取失败', { icon: 2 });
+        layer.open({
+          type: 1,
+          area: ['760px', '420px'],
+          title: '压测报告',
+          content: '<div style="padding:12px;"><pre>' + JSON.stringify(res.msg, null, 2) + '</pre></div>'
         });
       });
     });
@@ -434,7 +620,12 @@
     });
     $('.plugin_body').off('click', '.source-test').on('click', '.source-test', function () {
       api('test_source_connection', { source_id: $(this).data('id') }, function (res) {
-        layer.msg(res.msg || (res.status ? '连通' : '不通'), { icon: res.status ? 1 : 2 });
+        var msg = res.msg;
+        if (typeof msg === 'object') {
+          layer.msg((msg.msg || (res.status ? '连通' : '不通')) + ' [' + (msg.reason || 'unknown') + ']', { icon: res.status ? 1 : 2, time: 5000 });
+        } else {
+          layer.msg(msg || (res.status ? '连通' : '不通'), { icon: res.status ? 1 : 2 });
+        }
       });
     });
     $('.plugin_body').off('click', '.source-status').on('click', '.source-status', function () {
@@ -488,6 +679,8 @@
       });
     });
 
+    ensureMappingRowsInitialized();
+    syncMappingJsonPreview();
     refreshList();
   })();
 </script>

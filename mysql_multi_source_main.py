@@ -282,6 +282,18 @@ class mysql_multi_source_main:
             return "资源不足"
         return "未知问题"
 
+    def _classify_connectivity_error(self, err_msg):
+        err = str(err_msg or "").lower()
+        if "timed out" in err:
+            return "网络超时"
+        if "refused" in err:
+            return "端口拒绝"
+        if "no route" in err or "unreachable" in err:
+            return "路由不可达"
+        if "access denied" in err:
+            return "账号或权限错误"
+        return "未知连接错误"
+
     def _simulate_or_exec(self, source_id, cmd, allow_fail=False):
         # 当前插件以编排器为主，默认执行轻量验证命令并保留可替换的真实执行点
         self._append_log(source_id, "执行命令: {}".format(cmd))
@@ -426,9 +438,15 @@ class mysql_multi_source_main:
         if tool_name not in ["xtrabackup", "mariabackup"]:
             return public.returnMsg(False, "tool_name must be xtrabackup or mariabackup")
 
+        use_retry = hasattr(get, "retry") and str(get.retry).strip().lower() in ["1", "true", "yes", "on"]
         cmd = self._build_tool_install_cmd(tool_name)
         if not cmd:
             return public.returnMsg(False, "当前系统未识别，无法自动安装，请手工安装")
+        if use_retry:
+            if self._detect_os_family() == "debian":
+                cmd = "apt-get clean && rm -rf /var/lib/apt/lists/* && " + cmd
+            else:
+                cmd = "yum clean all || dnf clean all; " + cmd
 
         if not self._is_root_user():
             return public.returnMsg(
@@ -454,6 +472,15 @@ class mysql_multi_source_main:
                 },
             )
         return public.returnMsg(True, {"msg": "安装成功", "tool_name": tool_name, "log_path": install_log})
+
+    def get_tool_install_command(self, get):
+        if not hasattr(get, "tool_name"):
+            return public.returnMsg(False, "missing parameter: tool_name")
+        tool_name = str(get.tool_name).strip()
+        cmd = self._build_tool_install_cmd(tool_name)
+        if not cmd:
+            return public.returnMsg(False, "未识别系统，无法生成安装命令")
+        return public.returnMsg(True, {"tool_name": tool_name, "command": cmd})
 
     def get_tool_install_log(self, get=None):
         log_path = os.path.join(self.log_dir, "tool_install.log")
@@ -536,6 +563,23 @@ class mysql_multi_source_main:
         physical_ok = bool(tool.get("physical_ready"))
         add_item("physical_tool", "ok" if physical_ok else "warn", "ready" if physical_ok else "missing", "xtrabackup/mariabackup", "可安装物理工具提升速度")
 
+        if get is not None and hasattr(get, "repl_user") and str(get.repl_user).strip():
+            try:
+                repl_user = self._sql_escape(get.repl_user)
+                replica_host = "%"
+                if hasattr(get, "replica_host") and str(get.replica_host).strip():
+                    replica_host = self._sql_escape(get.replica_host)
+                rows = self._query_sql(
+                    "SELECT COUNT(*) FROM mysql.user WHERE user='{}' AND host='{}'".format(repl_user, replica_host)
+                )
+                count = int(rows[0][0]) if rows and not isinstance(rows[0], dict) else int(rows[0].get("COUNT(*)", 0)) if rows else 0
+                if count > 0:
+                    add_item("repl_user", "ok", "{}@{}".format(repl_user, replica_host), "存在", "复制账号已存在")
+                else:
+                    add_item("repl_user", "warn", "{}@{}".format(repl_user, replica_host), "存在", "可在主库修复时自动创建复制账号")
+            except Exception as ex:
+                add_item("repl_user", "warn", str(ex), "可检查", "无法校验复制账号，建议执行自动修复")
+
         return public.returnMsg(True, report)
 
     def master_health_report(self, get=None):
@@ -595,6 +639,10 @@ class mysql_multi_source_main:
                 "err": (err or "").strip()[:500],
             }
 
+        repl_user_result = None
+        if get is not None and hasattr(get, "repl_user") and hasattr(get, "repl_password") and hasattr(get, "replica_host"):
+            repl_user_result = self.master_create_repl_user(get)
+
         self._audit(
             data,
             "master_auto_fix_apply",
@@ -603,6 +651,7 @@ class mysql_multi_source_main:
                 "snapshot_id": snap["snapshot_id"],
                 "auto_restart": auto_restart,
                 "restart_result": restart_result,
+                "repl_user_result": repl_user_result.get("msg") if isinstance(repl_user_result, dict) else None,
             },
         )
         self._save_config(data)
@@ -614,6 +663,7 @@ class mysql_multi_source_main:
                 "need_restart": changed,
                 "auto_restart": auto_restart,
                 "restart_result": restart_result,
+                "repl_user_result": repl_user_result.get("msg") if isinstance(repl_user_result, dict) else None,
             },
         )
 
@@ -897,11 +947,37 @@ class mysql_multi_source_main:
         sock.settimeout(3)
         try:
             sock.connect((host, port))
-            return public.returnMsg(True, "主库网络连通")
+            return public.returnMsg(True, {"ok": True, "msg": "主库网络连通", "reason": "连接正常"})
         except Exception as ex:
-            return public.returnMsg(False, "主库网络不通: {}".format(ex))
+            return public.returnMsg(False, {"ok": False, "msg": "主库网络不通: {}".format(ex), "reason": self._classify_connectivity_error(ex)})
         finally:
             sock.close()
+
+    def test_master_connection_direct(self, get):
+        required = ["master_host", "master_port", "repl_user", "repl_password"]
+        for k in required:
+            if not hasattr(get, k) or not str(get.__getattribute__(k)).strip():
+                return public.returnMsg(False, "missing parameter: {}".format(k))
+        host = str(get.master_host).strip()
+        port = int(get.master_port)
+        user = self._sql_escape(get.repl_user)
+        pwd = self._sql_escape(get.repl_password)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        try:
+            sock.connect((host, port))
+        except Exception as ex:
+            return public.returnMsg(False, {"ok": False, "msg": "网络连通失败: {}".format(ex), "reason": self._classify_connectivity_error(ex)})
+        finally:
+            sock.close()
+        try:
+            cmd = "export MYSQL_PWD='{}' && mysql -h '{}' -P{} -u'{}' -e \"select 1\" && unset MYSQL_PWD".format(pwd, host, port, user)
+            out, err = public.ExecShell(cmd)
+            if err and err.strip():
+                return public.returnMsg(False, {"ok": False, "msg": err.strip(), "reason": self._classify_connectivity_error(err)})
+            return public.returnMsg(True, {"ok": True, "msg": "网络与账号校验通过", "reason": "可连接并可执行查询"})
+        except Exception as ex:
+            return public.returnMsg(False, {"ok": False, "msg": str(ex), "reason": self._classify_connectivity_error(ex)})
 
     def get_gtid_status(self, get=None):
         try:
@@ -1241,6 +1317,52 @@ class mysql_multi_source_main:
     def get_bootstrap_tasks(self, get=None):
         data = self._load_config()
         return public.returnMsg(True, data.get("bootstrap_tasks", []))
+
+    def run_stress_wizard(self, get):
+        source_count = int(get.source_count) if hasattr(get, "source_count") and str(get.source_count).isdigit() else 1
+        task_per_source = int(get.task_per_source) if hasattr(get, "task_per_source") and str(get.task_per_source).isdigit() else 1
+        mode = str(get.mode).strip() if hasattr(get, "mode") and str(get.mode).strip() else "auto"
+        data = self._load_config()
+        sources = data.get("sources", [])[:source_count]
+        if not sources:
+            return public.returnMsg(False, "没有可用于压测的来源")
+        created = 0
+        failed = 0
+        task_ids = []
+        for source in sources:
+            sid = source.get("source_id")
+            for _ in range(task_per_source):
+                resp = self.create_bootstrap_task(public.to_dict_obj({"source_id": sid, "mode": mode}))
+                if resp.get("status"):
+                    created += 1
+                    task = resp.get("msg", {})
+                    tid = task.get("task_id")
+                    task_ids.append(tid)
+                    self.trigger_bootstrap_task(public.to_dict_obj({"task_id": tid}))
+                else:
+                    failed += 1
+        return public.returnMsg(True, {"created": created, "failed": failed, "task_ids": task_ids[:100]})
+
+    def get_stress_report(self, get=None):
+        data = self._load_config()
+        tasks = data.get("bootstrap_tasks", [])
+        total = len(tasks)
+        done = len([t for t in tasks if t.get("status") == "done"])
+        failed = len([t for t in tasks if t.get("status") == "failed"])
+        running = len([t for t in tasks if t.get("status") == "running"])
+        avg_duration = 0
+        done_tasks = [t for t in tasks if t.get("status") == "done" and int(t.get("duration_seconds", 0) or 0) > 0]
+        if done_tasks:
+            avg_duration = int(sum([int(t.get("duration_seconds", 0) or 0) for t in done_tasks]) / len(done_tasks))
+        fail_types = {}
+        for t in tasks:
+            et = t.get("error_type")
+            if et:
+                fail_types[et] = fail_types.get(et, 0) + 1
+        success_rate = 0
+        if total > 0:
+            success_rate = round(float(done) / float(total), 4)
+        return public.returnMsg(True, {"total_tasks": total, "done": done, "failed": failed, "running": running, "avg_duration_seconds": avg_duration, "success_rate": success_rate, "fail_types": fail_types})
 
     def get_bootstrap_task(self, get):
         if not hasattr(get, "task_id"):
