@@ -94,3 +94,12 @@
 - hardening_plus 交付：
   - 压测脚本：`scripts/stress/stress_bootstrap_tasks.sh`、`scripts/stress/stress_bootstrap_tasks.ps1`
   - 运维文档：`docs/运维手册.md`、`docs/回滚手册.md`、`docs/上线检查清单.md`、`docs/验收报告模板.md`
+
+## 最后一公里实装（已完成）
+
+- 初始化任务默认模式调整为 `auto`，会自动选择 physical/logical
+- 当物理工具缺失时，自动降级到 `mysqldump/mysql` 逻辑链路
+- 逻辑链路已支持真实执行：
+  - 按映射建目标库
+  - 从主库导出 source_db
+  - 导入从库 target_db

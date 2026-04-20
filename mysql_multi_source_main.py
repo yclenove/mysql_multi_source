@@ -198,6 +198,23 @@ class mysql_multi_source_main:
             raise Exception(err.strip())
         return out, err
 
+    def _get_local_mysql_root_password(self):
+        try:
+            return public.M("config").where("id=?", (1,)).getField("mysql_root")
+        except Exception:
+            return ""
+
+    def _resolve_task_mode(self, task_mode):
+        mode = str(task_mode or "auto").strip().lower()
+        if mode == "physical":
+            return "physical"
+        if mode == "logical":
+            return "logical"
+        # auto fallback
+        if self._check_command_exists("xtrabackup") or self._check_command_exists("mariabackup"):
+            return "physical"
+        return "logical"
+
     def _run_physical_bootstrap(self, source, task):
         source_id = source.get("source_id")
         if not (self._check_command_exists("xtrabackup") or self._check_command_exists("mariabackup")):
@@ -219,13 +236,56 @@ class mysql_multi_source_main:
             raise Exception("未检测到 mysql 客户端，无法执行逻辑初始化")
 
         mappings = source.get("db_mappings", [])
+        if not mappings:
+            raise Exception("未配置库映射")
+
+        source_host = self._sql_escape(source.get("master_host"))
+        source_port = int(source.get("master_port", 3306))
+        source_user = self._sql_escape(source.get("repl_user"))
+        source_pwd = self._sql_escape(source.get("repl_password"))
+        local_root_pwd = self._sql_escape(self._get_local_mysql_root_password())
+        if not local_root_pwd:
+            raise Exception("未获取到本地MySQL root密码，无法执行导入")
+
         task_dir = os.path.join(self.bootstrap_root, task.get("task_id"))
         if not os.path.exists(task_dir):
             os.makedirs(task_dir)
         for m in mappings:
-            dump_file = os.path.join(task_dir, "{}.sql".format(m.get("source_db")))
-            self._simulate_or_exec(source_id, "echo dump_{} > \"{}\"".format(m.get("source_db"), dump_file))
-            time.sleep(0.1)
+            source_db = self._sql_escape(m.get("source_db"))
+            target_db = self._sql_escape(m.get("target_db"))
+            dump_file = os.path.join(task_dir, "{}__to__{}.sql".format(source_db, target_db))
+
+            create_db_sql = "CREATE DATABASE IF NOT EXISTS `{}` CHARACTER SET utf8mb4".format(target_db)
+            self._exec_sql(create_db_sql)
+            self._append_task_log(task.get("task_id"), "ensure target db: {}".format(target_db))
+
+            dump_cmd = (
+                "export MYSQL_PWD='{pwd}' && "
+                "mysqldump --single-transaction --quick --routines --events --triggers "
+                "--host='{host}' --port={port} --user='{user}' '{db}' > '{file}' && "
+                "unset MYSQL_PWD"
+            ).format(
+                pwd=source_pwd,
+                host=source_host,
+                port=source_port,
+                user=source_user,
+                db=source_db,
+                file=dump_file.replace("\\", "/"),
+            )
+            self._simulate_or_exec(source_id, dump_cmd)
+            self._append_task_log(task.get("task_id"), "dump done: {}".format(source_db))
+
+            import_cmd = (
+                "export MYSQL_PWD='{pwd}' && "
+                "mysql --host='127.0.0.1' --port=3306 --user='root' '{target}' < '{file}' && "
+                "unset MYSQL_PWD"
+            ).format(
+                pwd=local_root_pwd,
+                target=target_db,
+                file=dump_file.replace("\\", "/"),
+            )
+            self._simulate_or_exec(source_id, import_cmd)
+            self._append_task_log(task.get("task_id"), "import done: {} -> {}".format(source_db, target_db))
         return True
 
     def recover_bootstrap_tasks(self, get=None):
@@ -520,11 +580,11 @@ class mysql_multi_source_main:
     def create_bootstrap_task(self, get):
         if not hasattr(get, "source_id"):
             return public.returnMsg(False, "missing parameter: source_id")
-        mode = "physical"
+        mode = "auto"
         if hasattr(get, "mode") and str(get.mode).strip():
             mode = str(get.mode).strip()
-        if mode not in ["physical", "logical"]:
-            return public.returnMsg(False, "mode must be physical or logical")
+        if mode not in ["auto", "physical", "logical"]:
+            return public.returnMsg(False, "mode must be auto/physical/logical")
 
         data = self._load_config()
         source = self._find_source(data, str(get.source_id).strip())
@@ -610,7 +670,9 @@ class mysql_multi_source_main:
                 raise Exception("库映射为空")
 
             self._task_step_update(data, task, "备份数据", 30)
-            if task.get("mode") == "physical":
+            effective_mode = self._resolve_task_mode(task.get("mode"))
+            task["effective_mode"] = effective_mode
+            if effective_mode == "physical":
                 self._run_physical_bootstrap(source, task)
             else:
                 self._run_logical_bootstrap(source, task)
