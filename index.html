@@ -7,6 +7,7 @@
       <button class="btn btn-success btn-sm" id="btn-health">健康检查</button>
       <button class="btn btn-default btn-sm" id="btn-gtid">GTID状态</button>
       <button class="btn btn-default btn-sm" id="btn-overview">总览指标</button>
+      <button class="btn btn-default btn-sm" id="btn-check-tools">检测工具</button>
       <button class="btn btn-default btn-sm" id="btn-refresh">刷新来源</button>
     </div>
 
@@ -43,6 +44,16 @@
       <button class="btn btn-sm btn-default" id="btn-task-detail">任务详情</button>
       <button class="btn btn-sm btn-default" id="btn-task-log">任务日志</button>
       <button class="btn btn-sm btn-default" id="btn-list-boot">查看任务</button>
+    </div>
+
+    <div class="mb15">
+      <h3 style="margin: 0 0 8px;">物理工具安装助手</h3>
+      <select class="bt-input-text mr5" id="tool_name" style="width: 160px;">
+        <option value="xtrabackup">xtrabackup</option>
+        <option value="mariabackup">mariabackup</option>
+      </select>
+      <button class="btn btn-sm btn-default" id="btn-install-tool">一键安装</button>
+      <button class="btn btn-sm btn-default" id="btn-tool-log">安装日志</button>
     </div>
 
     <table class="table table-hover">
@@ -121,6 +132,25 @@
     });
 
     $('#btn-refresh').on('click', refreshList);
+    $('#btn-check-tools').on('click', function () {
+      api('check_bootstrap_tools', {}, function (res) {
+        if (!res.status) return layer.msg(res.msg || '检测失败', { icon: 2 });
+        var r = res.msg;
+        var text = 'root=' + r.is_root +
+          '\nos=' + r.os_family +
+          '\nxtrabackup=' + r.xtrabackup +
+          '\nmariabackup=' + r.mariabackup +
+          '\nmysqldump=' + r.mysqldump +
+          '\nmysql=' + r.mysql +
+          '\nrecommended_mode=' + r.recommended_mode;
+        layer.open({
+          type: 1,
+          area: ['620px', '360px'],
+          title: '工具检测结果',
+          content: '<div style="padding:12px;"><pre>' + text + '</pre></div>'
+        });
+      });
+    });
     $('#btn-overview').on('click', function () {
       api('overview_metrics', {}, function (res) {
         if (!res.status) return layer.msg(res.msg || '总览获取失败', { icon: 2 });
@@ -213,6 +243,38 @@
           type: 1,
           area: ['760px', '420px'],
           title: '任务日志',
+          content: '<div style="padding:12px;"><pre style="max-height:360px;overflow:auto;">' + (res.msg || '暂无日志') + '</pre></div>'
+        });
+      });
+    });
+    $('#btn-install-tool').on('click', function () {
+      var toolName = $('#tool_name').val();
+      bt.confirm({ title: '安装确认', msg: '确认安装工具: ' + toolName + ' ?' }, function () {
+        api('install_bootstrap_tool', { tool_name: toolName }, function (res) {
+          if (res.status) {
+            layer.msg('安装成功', { icon: 1 });
+            return;
+          }
+          if (res.msg && typeof res.msg === 'object' && res.msg.need_root) {
+            layer.open({
+              type: 1,
+              area: ['760px', '300px'],
+              title: '需要root手工执行',
+              content: '<div style="padding:12px;"><pre>' + res.msg.msg + '\n\n手工命令:\n' + res.msg.manual_cmd + '</pre></div>'
+            });
+            return;
+          }
+          layer.msg((res.msg && res.msg.msg) || res.msg || '安装失败', { icon: 2 });
+        });
+      });
+    });
+    $('#btn-tool-log').on('click', function () {
+      api('get_tool_install_log', {}, function (res) {
+        if (!res.status) return layer.msg(res.msg || '获取失败', { icon: 2 });
+        layer.open({
+          type: 1,
+          area: ['760px', '420px'],
+          title: '工具安装日志',
           content: '<div style="padding:12px;"><pre style="max-height:360px;overflow:auto;">' + (res.msg || '暂无日志') + '</pre></div>'
         });
       });

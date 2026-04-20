@@ -8,6 +8,7 @@ import socket
 import sys
 import time
 import uuid
+import platform
 
 if "/www/server/panel/class" not in sys.path:
     sys.path.insert(0, "/www/server/panel/class")
@@ -169,6 +170,42 @@ class mysql_multi_source_main:
         out = public.ExecShell("command -v {}".format(command_name))[0].strip()
         return bool(out)
 
+    def _is_root_user(self):
+        try:
+            return os.geteuid() == 0
+        except Exception:
+            out = public.ExecShell("id -u")[0].strip()
+            return out == "0"
+
+    def _detect_os_family(self):
+        os_release = public.ReadFile("/etc/os-release") or ""
+        lower = os_release.lower()
+        if "ubuntu" in lower or "debian" in lower:
+            return "debian"
+        if "centos" in lower or "rocky" in lower or "almalinux" in lower or "rhel" in lower or "fedora" in lower:
+            return "redhat"
+        # 兜底
+        system_name = platform.system().lower()
+        if "linux" in system_name:
+            return "linux"
+        return "unknown"
+
+    def _build_tool_install_cmd(self, tool_name):
+        os_family = self._detect_os_family()
+        if tool_name not in ["xtrabackup", "mariabackup"]:
+            return ""
+
+        # 尽量使用系统仓库路径，避免外部脚本安装
+        if os_family == "debian":
+            if tool_name == "xtrabackup":
+                return "apt-get update && apt-get install -y percona-xtrabackup-80"
+            return "apt-get update && apt-get install -y mariadb-backup"
+        if os_family in ["redhat", "linux"]:
+            if tool_name == "xtrabackup":
+                return "yum install -y percona-xtrabackup-80 || dnf install -y percona-xtrabackup-80"
+            return "yum install -y mariadb-backup || dnf install -y mariadb-backup"
+        return ""
+
     def _task_step_update(self, data, task, step, progress):
         task["current_step"] = step
         task["progress"] = progress
@@ -312,6 +349,62 @@ class mysql_multi_source_main:
             recovered += 1
         self._save_config(data)
         return public.returnMsg(True, {"recovered_tasks": recovered})
+
+    def check_bootstrap_tools(self, get=None):
+        result = {
+            "is_root": self._is_root_user(),
+            "os_family": self._detect_os_family(),
+            "xtrabackup": self._check_command_exists("xtrabackup"),
+            "mariabackup": self._check_command_exists("mariabackup"),
+            "mysqldump": self._check_command_exists("mysqldump"),
+            "mysql": self._check_command_exists("mysql"),
+        }
+        result["physical_ready"] = result["xtrabackup"] or result["mariabackup"]
+        result["logical_ready"] = result["mysqldump"] and result["mysql"]
+        result["recommended_mode"] = "physical" if result["physical_ready"] else "logical"
+        return public.returnMsg(True, result)
+
+    def install_bootstrap_tool(self, get):
+        if not hasattr(get, "tool_name"):
+            return public.returnMsg(False, "missing parameter: tool_name")
+        tool_name = str(get.tool_name).strip()
+        if tool_name not in ["xtrabackup", "mariabackup"]:
+            return public.returnMsg(False, "tool_name must be xtrabackup or mariabackup")
+
+        cmd = self._build_tool_install_cmd(tool_name)
+        if not cmd:
+            return public.returnMsg(False, "当前系统未识别，无法自动安装，请手工安装")
+
+        if not self._is_root_user():
+            return public.returnMsg(
+                False,
+                {
+                    "need_root": True,
+                    "msg": "当前非root执行，无法自动安装",
+                    "manual_cmd": cmd,
+                },
+            )
+
+        install_log = os.path.join(self.log_dir, "tool_install.log")
+        exec_cmd = "{} > \"{}\" 2>&1".format(cmd, install_log)
+        out, err = public.ExecShell(exec_cmd)
+        ok = self._check_command_exists(tool_name)
+        if not ok:
+            return public.returnMsg(
+                False,
+                {
+                    "msg": "自动安装执行完成但未检测到工具，请查看安装日志",
+                    "log_path": install_log,
+                    "manual_cmd": cmd,
+                },
+            )
+        return public.returnMsg(True, {"msg": "安装成功", "tool_name": tool_name, "log_path": install_log})
+
+    def get_tool_install_log(self, get=None):
+        log_path = os.path.join(self.log_dir, "tool_install.log")
+        if not os.path.exists(log_path):
+            return public.returnMsg(True, "")
+        return public.returnMsg(True, public.ReadFile(log_path) or "")
 
     def health_check(self, get=None):
         data = self._load_config()

@@ -103,3 +103,13 @@
   - 按映射建目标库
   - 从主库导出 source_db
   - 导入从库 target_db
+
+## 工具安装助手（已完成）
+
+- 新增工具检测接口：`check_bootstrap_tools`
+- 新增工具安装接口：`install_bootstrap_tool`
+- 新增安装日志接口：`get_tool_install_log`
+- 策略：
+  - 有 root 权限时支持一键安装
+  - 无 root 权限时返回手工命令指引
+  - 安装命令优先系统仓库，不使用外部脚本拉取
