@@ -12,9 +12,12 @@ import PluginLoader
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: btpython start_sync.py <method> <source_id>")
+        print("Usage: btpython start_sync.py <method> <task_id_or_source_id>")
         sys.exit(1)
 
     method = sys.argv[1]
-    source_id = sys.argv[2]
-    PluginLoader.plugin_run("mysql_multi_source", method, {"source_id": source_id})
+    arg_value = sys.argv[2]
+    payload = {"source_id": arg_value}
+    if "task" in method:
+        payload = {"task_id": arg_value}
+    PluginLoader.plugin_run("mysql_multi_source", method, payload)

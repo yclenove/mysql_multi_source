@@ -36,6 +36,10 @@
         <option value="logical">logical</option>
       </select>
       <button class="btn btn-sm btn-default" id="btn-create-boot">创建任务</button>
+      <input class="bt-input-text mr5" style="width: 160px;" id="boot_task_id" placeholder="任务ID">
+      <button class="btn btn-sm btn-default" id="btn-run-boot">后台执行</button>
+      <button class="btn btn-sm btn-default" id="btn-cancel-boot">取消任务</button>
+      <button class="btn btn-sm btn-default" id="btn-task-detail">任务详情</button>
       <button class="btn btn-sm btn-default" id="btn-list-boot">查看任务</button>
     </div>
 
@@ -166,6 +170,32 @@
           area: ['800px', '420px'],
           title: '初始化任务列表',
           content: '<div style="padding:12px;"><pre style="max-height:360px;overflow:auto;">' + (text || '暂无任务') + '</pre></div>'
+        });
+      });
+    });
+    $('#btn-run-boot').on('click', function () {
+      var taskId = $('#boot_task_id').val();
+      api('trigger_bootstrap_task', { task_id: taskId }, function (res) {
+        if (!res.status) return layer.msg(res.msg || '触发失败', { icon: 2 });
+        layer.msg('已后台执行', { icon: 1 });
+      });
+    });
+    $('#btn-cancel-boot').on('click', function () {
+      var taskId = $('#boot_task_id').val();
+      api('cancel_bootstrap_task', { task_id: taskId }, function (res) {
+        if (!res.status) return layer.msg(res.msg || '取消失败', { icon: 2 });
+        layer.msg('任务已取消', { icon: 1 });
+      });
+    });
+    $('#btn-task-detail').on('click', function () {
+      var taskId = $('#boot_task_id').val();
+      api('get_bootstrap_task', { task_id: taskId }, function (res) {
+        if (!res.status) return layer.msg(res.msg || '获取失败', { icon: 2 });
+        layer.open({
+          type: 1,
+          area: ['760px', '420px'],
+          title: '任务详情',
+          content: '<div style="padding:12px;"><pre>' + JSON.stringify(res.msg, null, 2) + '</pre></div>'
         });
       });
     });

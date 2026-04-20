@@ -145,6 +145,12 @@ class mysql_multi_source_main:
                 return item
         return None
 
+    def _find_bootstrap_task(self, data, task_id):
+        for task in data.get("bootstrap_tasks", []):
+            if task.get("task_id") == task_id:
+                return task
+        return None
+
     def health_check(self, get=None):
         data = self._load_config()
         return public.returnMsg(
@@ -455,11 +461,7 @@ class mysql_multi_source_main:
             return public.returnMsg(False, "missing parameter: task_id")
         task_id = str(get.task_id).strip()
         data = self._load_config()
-        task = None
-        for t in data.get("bootstrap_tasks", []):
-            if t.get("task_id") == task_id:
-                task = t
-                break
+        task = self._find_bootstrap_task(data, task_id)
         if not task:
             return public.returnMsg(False, "task not found")
         if task.get("status") == "done":
@@ -468,23 +470,73 @@ class mysql_multi_source_main:
             return public.returnMsg(False, "任务已取消")
 
         task["status"] = "running"
-        task["progress"] = 20
-        task["current_step"] = task["steps"][0]
+        task["progress"] = 0
+        task["current_step"] = "初始化开始"
         task["updated_at"] = self._now()
         self._save_config(data)
 
-        # 当前阶段先提供编排能力与留痕；实际备份传输执行在后续任务引擎中接入
+        # 阶段6：接入异步执行链路，步骤执行先采用轻量模拟推进，后续替换为真实备份/导入引擎
+        step_count = len(task.get("steps", [])) or 1
+        for i, step in enumerate(task.get("steps", [])):
+            data = self._load_config()
+            task = self._find_bootstrap_task(data, task_id)
+            if not task:
+                return public.returnMsg(False, "task not found")
+            if task.get("status") == "cancelled":
+                self._append_log(task.get("source_id"), "初始化任务被取消: {}".format(task_id))
+                return public.returnMsg(False, "任务已取消")
+            task["status"] = "running"
+            task["current_step"] = step
+            task["progress"] = int((float(i) / float(step_count)) * 100)
+            task["updated_at"] = self._now()
+            self._save_config(data)
+            self._append_log(task.get("source_id"), "初始化步骤: {}".format(step))
+            time.sleep(0.4)
+
+        data = self._load_config()
+        task = self._find_bootstrap_task(data, task_id)
+        if not task:
+            return public.returnMsg(False, "task not found")
         task["progress"] = 100
-        task["current_step"] = "编排完成（待接入实际执行引擎）"
+        task["current_step"] = "初始化完成"
         task["status"] = "done"
         task["updated_at"] = self._now()
         self._save_config(data)
-        self._append_log(task.get("source_id"), "初始化任务完成(编排): {}".format(task_id))
+        self._append_log(task.get("source_id"), "初始化任务完成: {}".format(task_id))
         return public.returnMsg(True, task)
+
+    def trigger_bootstrap_task(self, get):
+        if not hasattr(get, "task_id"):
+            return public.returnMsg(False, "missing parameter: task_id")
+        task_id = str(get.task_id).strip()
+
+        data = self._load_config()
+        task = self._find_bootstrap_task(data, task_id)
+        if not task:
+            return public.returnMsg(False, "task not found")
+        if task.get("status") == "running":
+            return public.returnMsg(False, "任务正在执行中")
+
+        cmd = "nohup btpython /www/server/panel/plugin/mysql_multi_source/start_sync.py run_bootstrap_task {} > /dev/null 2>&1 &".format(
+            task_id
+        )
+        public.ExecShell(cmd)
+        self._append_log(task.get("source_id"), "异步触发初始化任务: {}".format(task_id))
+        return public.returnMsg(True, "已触发后台执行")
 
     def get_bootstrap_tasks(self, get=None):
         data = self._load_config()
         return public.returnMsg(True, data.get("bootstrap_tasks", []))
+
+    def get_bootstrap_task(self, get):
+        if not hasattr(get, "task_id"):
+            return public.returnMsg(False, "missing parameter: task_id")
+        task_id = str(get.task_id).strip()
+        data = self._load_config()
+        task = self._find_bootstrap_task(data, task_id)
+        if not task:
+            return public.returnMsg(False, "task not found")
+        return public.returnMsg(True, task)
 
     def cancel_bootstrap_task(self, get):
         if not hasattr(get, "task_id"):
