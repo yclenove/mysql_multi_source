@@ -9,6 +9,10 @@ import sys
 import time
 import uuid
 import platform
+import hashlib
+import hmac
+import base64
+import copy
 
 if "/www/server/panel/class" not in sys.path:
     sys.path.insert(0, "/www/server/panel/class")
@@ -24,6 +28,8 @@ class mysql_multi_source_main:
     log_dir = "/www/server/panel/plugin/mysql_multi_source/log"
     bootstrap_root = "/www/server/panel/plugin/mysql_multi_source/bootstrap_data"
     task_stale_timeout = 120
+    sign_secret_path = "/www/server/panel/plugin/mysql_multi_source/profile_sign.key"
+    mysql_cnf_path = "/etc/my.cnf"
 
     def __init__(self):
         pass
@@ -114,6 +120,7 @@ class mysql_multi_source_main:
     def _default_config(self):
         return {
             "version": "1",
+            "mode": "replica_mode",
             "slave_instance": {
                 "host": "127.0.0.1",
                 "port": 3306,
@@ -121,6 +128,10 @@ class mysql_multi_source_main:
             },
             "sources": [],
             "bootstrap_tasks": [],
+            "master_profiles": [],
+            "handshake_sessions": [],
+            "change_snapshots": [],
+            "audit_logs": [],
         }
 
     def _ensure_dirs(self):
@@ -147,8 +158,52 @@ class mysql_multi_source_main:
             return self._default_config()
 
     def _save_config(self, data):
+        data.setdefault("mode", "replica_mode")
+        data.setdefault("master_profiles", [])
+        data.setdefault("handshake_sessions", [])
+        data.setdefault("change_snapshots", [])
+        data.setdefault("audit_logs", [])
         data["slave_instance"]["updated_at"] = self._now()
         return bool(public.WriteFile(self.config_path, json.dumps(data)))
+
+    def _audit(self, data, action, detail):
+        logs = data.setdefault("audit_logs", [])
+        logs.insert(0, {
+            "id": "audit_" + uuid.uuid4().hex[:10],
+            "action": action,
+            "detail": detail,
+            "created_at": self._now(),
+        })
+        data["audit_logs"] = logs[:2000]
+
+    def _create_snapshot(self, data, category, payload):
+        snaps = data.setdefault("change_snapshots", [])
+        snap = {
+            "snapshot_id": "snap_" + uuid.uuid4().hex[:12],
+            "category": category,
+            "payload": payload,
+            "created_at": self._now(),
+        }
+        snaps.insert(0, snap)
+        data["change_snapshots"] = snaps[:500]
+        return snap
+
+    def _sign_secret(self):
+        self._ensure_dirs()
+        if os.path.exists(self.sign_secret_path):
+            return (public.ReadFile(self.sign_secret_path) or "").strip()
+        secret = uuid.uuid4().hex + uuid.uuid4().hex
+        public.WriteFile(self.sign_secret_path, secret)
+        return secret
+
+    def _profile_sign(self, payload):
+        secret = self._sign_secret().encode("utf-8")
+        raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        return hmac.new(secret, raw, hashlib.sha256).hexdigest()
+
+    def _profile_verify(self, payload, signature):
+        expect = self._profile_sign(payload)
+        return hmac.compare_digest(expect, str(signature or ""))
 
     def _find_source(self, data, source_id):
         for item in data.get("sources", []):
@@ -413,10 +468,319 @@ class mysql_multi_source_main:
             {
                 "plugin": "mysql_multi_source",
                 "version": data.get("version", "1"),
+                "mode": data.get("mode", "replica_mode"),
                 "sources_count": len(data.get("sources", [])),
                 "bootstrap_tasks_count": len(data.get("bootstrap_tasks", [])),
             },
         )
+
+    def set_running_mode(self, get):
+        if not hasattr(get, "mode"):
+            return public.returnMsg(False, "missing parameter: mode")
+        mode = str(get.mode).strip()
+        if mode not in ["master_mode", "replica_mode"]:
+            return public.returnMsg(False, "mode must be master_mode or replica_mode")
+        data = self._load_config()
+        old = data.get("mode", "replica_mode")
+        data["mode"] = mode
+        self._audit(data, "set_running_mode", {"old": old, "new": mode})
+        self._save_config(data)
+        return public.returnMsg(True, {"mode": mode})
+
+    def get_running_mode(self, get=None):
+        data = self._load_config()
+        return public.returnMsg(True, {"mode": data.get("mode", "replica_mode")})
+
+    def master_health_check(self, get=None):
+        report = {
+            "items": [],
+            "summary": {"ok": 0, "warn": 0, "fail": 0},
+        }
+
+        def add_item(name, status, current, expected, suggestion):
+            report["items"].append({
+                "name": name,
+                "status": status,
+                "current": current,
+                "expected": expected,
+                "suggestion": suggestion,
+            })
+            report["summary"][status] += 1
+
+        try:
+            gtid = self._query_sql("SHOW VARIABLES LIKE 'gtid_mode'")
+            gtid_value = (gtid[0][1] if gtid and not isinstance(gtid[0], dict) else (gtid[0].get("Value") if gtid else "UNKNOWN"))
+            add_item("gtid_mode", "ok" if str(gtid_value).upper() == "ON" else "fail", gtid_value, "ON", "开启 gtid_mode=ON")
+        except Exception as ex:
+            add_item("gtid_mode", "fail", str(ex), "ON", "检查MySQL连接和权限")
+
+        checks = [
+            ("enforce_gtid_consistency", "ON"),
+            ("log_bin", "ON"),
+            ("binlog_format", "ROW"),
+            ("server_id", ">=1"),
+        ]
+        for key, expected in checks:
+            try:
+                rows = self._query_sql("SHOW VARIABLES LIKE '{}'".format(key))
+                value = rows[0][1] if rows and not isinstance(rows[0], dict) else (rows[0].get("Value") if rows else "UNKNOWN")
+                if key == "server_id":
+                    ok = str(value).isdigit() and int(value) > 0
+                else:
+                    ok = str(value).upper() == expected
+                add_item(key, "ok" if ok else "fail", value, expected, "修复 {}".format(key))
+            except Exception as ex:
+                add_item(key, "fail", str(ex), expected, "检查变量查询权限")
+
+        tool = self.check_bootstrap_tools().get("msg", {})
+        physical_ok = bool(tool.get("physical_ready"))
+        add_item("physical_tool", "ok" if physical_ok else "warn", "ready" if physical_ok else "missing", "xtrabackup/mariabackup", "可安装物理工具提升速度")
+
+        return public.returnMsg(True, report)
+
+    def master_health_report(self, get=None):
+        return self.master_health_check(get)
+
+    def master_auto_fix_preview(self, get=None):
+        report = self.master_health_check().get("msg", {})
+        actions = []
+        need_restart = False
+        for item in report.get("items", []):
+            if item["status"] != "ok":
+                if item["name"] in ["gtid_mode", "enforce_gtid_consistency", "log_bin", "binlog_format", "server_id"]:
+                    actions.append("修改 my.cnf: {}".format(item["name"]))
+                    need_restart = True
+                elif item["name"] == "physical_tool":
+                    actions.append("可选安装物理工具")
+        return public.returnMsg(True, {"actions": actions, "need_restart": need_restart})
+
+    def _apply_master_mycnf_fix(self):
+        content = public.ReadFile(self.mysql_cnf_path) or ""
+        if "[mysqld]" not in content:
+            content += "\n[mysqld]\n"
+        required = {
+            "gtid_mode": "ON",
+            "enforce_gtid_consistency": "ON",
+            "log_bin": "ON",
+            "binlog_format": "ROW",
+        }
+        updated = content
+        for k, v in required.items():
+            pattern = r"(?m)^{}\s*=.*$".format(re.escape(k))
+            if re.search(pattern, updated):
+                updated = re.sub(pattern, "{}={}".format(k, v), updated)
+            else:
+                updated = updated.replace("[mysqld]", "[mysqld]\n{}={}".format(k, v))
+        if not re.search(r"(?m)^server_id\s*=", updated):
+            updated = updated.replace("[mysqld]", "[mysqld]\nserver_id={}".format(int(time.time()) % 100000 + 100))
+        if updated != content:
+            public.WriteFile(self.mysql_cnf_path, updated)
+            return True
+        return False
+
+    def master_auto_fix_apply(self, get=None):
+        data = self._load_config()
+        snap = self._create_snapshot(data, "master_auto_fix", {"my_cnf": public.ReadFile(self.mysql_cnf_path) or ""})
+        changed = self._apply_master_mycnf_fix()
+        self._audit(data, "master_auto_fix_apply", {"changed": changed, "snapshot_id": snap["snapshot_id"]})
+        self._save_config(data)
+        return public.returnMsg(True, {"changed": changed, "snapshot_id": snap["snapshot_id"], "need_restart": changed})
+
+    def master_restart_mysql(self, get=None):
+        data = self._load_config()
+        # 使用宝塔常见服务控制方式
+        out, err = public.ExecShell("/etc/init.d/mysqld restart || systemctl restart mysqld || systemctl restart mysql")
+        ok = not bool(err.strip())
+        self._audit(data, "master_restart_mysql", {"ok": ok, "err": err.strip()[:500]})
+        self._save_config(data)
+        if not ok:
+            return public.returnMsg(False, "重启失败: {}".format(err))
+        return public.returnMsg(True, "重启成功")
+
+    def master_create_repl_user(self, get):
+        required = ["repl_user", "repl_password", "replica_host"]
+        for k in required:
+            if not hasattr(get, k) or not str(get.__getattribute__(k)).strip():
+                return public.returnMsg(False, "missing parameter: {}".format(k))
+        user = self._sql_escape(get.repl_user)
+        pwd = self._sql_escape(get.repl_password)
+        host = self._sql_escape(get.replica_host)
+        try:
+            self._exec_sql("CREATE USER IF NOT EXISTS '{}'@'{}' IDENTIFIED BY '{}'".format(user, host, pwd))
+            try:
+                self._exec_sql("GRANT REPLICATION REPLICA, REPLICATION CLIENT ON *.* TO '{}'@'{}'".format(user, host))
+            except Exception:
+                self._exec_sql("GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '{}'@'{}'".format(user, host))
+            self._exec_sql("FLUSH PRIVILEGES")
+            data = self._load_config()
+            self._audit(data, "master_create_repl_user", {"user": user, "host": host})
+            self._save_config(data)
+            return public.returnMsg(True, "复制账号创建成功")
+        except Exception as ex:
+            return public.returnMsg(False, "创建复制账号失败: {}".format(ex))
+
+    def master_export_signed_profile(self, get):
+        required = ["source_id", "channel_name", "master_host", "master_port", "repl_user", "repl_password"]
+        for k in required:
+            if not hasattr(get, k):
+                return public.returnMsg(False, "missing parameter: {}".format(k))
+        ttl = int(get.ttl_seconds) if hasattr(get, "ttl_seconds") and str(get.ttl_seconds).strip().isdigit() else 3600
+        payload = {
+            "source_id": str(get.source_id).strip(),
+            "channel_name": str(get.channel_name).strip(),
+            "master_host": str(get.master_host).strip(),
+            "master_port": int(get.master_port),
+            "repl_user": str(get.repl_user).strip(),
+            "repl_password": str(get.repl_password).strip(),
+            "db_mappings": json.loads(get.db_mappings) if hasattr(get, "db_mappings") and str(get.db_mappings).strip() else [],
+            "created_at": self._now(),
+            "expires_at": self._now() + ttl,
+        }
+        signature = self._profile_sign(payload)
+        data = self._load_config()
+        profile_id = "profile_" + uuid.uuid4().hex[:12]
+        wrapped = {"profile_id": profile_id, "payload": payload, "signature": signature}
+        data.setdefault("master_profiles", []).insert(0, wrapped)
+        self._audit(data, "master_export_signed_profile", {"profile_id": profile_id, "source_id": payload["source_id"]})
+        self._save_config(data)
+        encoded = base64.b64encode(json.dumps(wrapped, ensure_ascii=False).encode("utf-8")).decode("utf-8")
+        return public.returnMsg(True, {"profile_id": profile_id, "profile_b64": encoded, "signature": signature})
+
+    def master_get_profile(self, get):
+        if not hasattr(get, "profile_id"):
+            return public.returnMsg(False, "missing parameter: profile_id")
+        data = self._load_config()
+        pid = str(get.profile_id).strip()
+        for p in data.get("master_profiles", []):
+            if p.get("profile_id") == pid:
+                return public.returnMsg(True, p)
+        return public.returnMsg(False, "profile not found")
+
+    def replica_verify_profile(self, get):
+        if not hasattr(get, "profile_b64"):
+            return public.returnMsg(False, "missing parameter: profile_b64")
+        try:
+            raw = base64.b64decode(str(get.profile_b64).encode("utf-8")).decode("utf-8")
+            obj = json.loads(raw)
+            payload = obj.get("payload", {})
+            signature = obj.get("signature", "")
+            if int(payload.get("expires_at", 0)) < self._now():
+                return public.returnMsg(False, "profile expired")
+            ok = self._profile_verify(payload, signature)
+            return public.returnMsg(True, {"verified": ok, "payload": payload, "signature": signature})
+        except Exception as ex:
+            return public.returnMsg(False, "profile parse error: {}".format(ex))
+
+    def replica_import_profile(self, get):
+        verify = self.replica_verify_profile(get)
+        if verify.get("status") is False:
+            return verify
+        if not verify.get("msg", {}).get("verified"):
+            return public.returnMsg(False, "profile signature verify failed")
+        payload = verify["msg"]["payload"]
+        data = self._load_config()
+        sid = payload.get("source_id")
+        if self._find_source(data, sid):
+            return public.returnMsg(False, "source_id already exists")
+        source = {
+            "source_id": sid,
+            "channel_name": payload.get("channel_name"),
+            "master_host": payload.get("master_host"),
+            "master_port": int(payload.get("master_port", 3306)),
+            "repl_user": payload.get("repl_user"),
+            "repl_password": payload.get("repl_password"),
+            "sync_mode": "gtid",
+            "db_mappings": payload.get("db_mappings", []),
+            "init_strategy": "auto",
+            "status": {"running": False, "io_running": "No", "sql_running": "No", "seconds_behind": None, "last_error": ""},
+            "created_at": self._now(),
+            "updated_at": self._now(),
+        }
+        data["sources"].append(source)
+        self._audit(data, "replica_import_profile", {"source_id": sid})
+        self._save_config(data)
+        return public.returnMsg(True, "profile导入成功")
+
+    def master_create_handshake(self, get):
+        if not hasattr(get, "profile_b64"):
+            return public.returnMsg(False, "missing parameter: profile_b64")
+        token = "hs_" + uuid.uuid4().hex
+        ttl = int(get.ttl_seconds) if hasattr(get, "ttl_seconds") and str(get.ttl_seconds).strip().isdigit() else 600
+        data = self._load_config()
+        session = {
+            "token": token,
+            "profile_b64": str(get.profile_b64),
+            "status": "pending",
+            "created_at": self._now(),
+            "expires_at": self._now() + ttl,
+            "consumed": False,
+        }
+        data.setdefault("handshake_sessions", []).insert(0, session)
+        self._audit(data, "master_create_handshake", {"token": token, "expires_at": session["expires_at"]})
+        self._save_config(data)
+        return public.returnMsg(True, {"token": token, "expires_at": session["expires_at"]})
+
+    def replica_accept_handshake(self, get):
+        if not hasattr(get, "token"):
+            return public.returnMsg(False, "missing parameter: token")
+        token = str(get.token).strip()
+        data = self._load_config()
+        target = None
+        for s in data.get("handshake_sessions", []):
+            if s.get("token") == token:
+                target = s
+                break
+        if not target:
+            return public.returnMsg(False, "token not found")
+        if target.get("consumed"):
+            return public.returnMsg(False, "token consumed")
+        if int(target.get("expires_at", 0)) < self._now():
+            return public.returnMsg(False, "token expired")
+        resp = self.replica_import_profile(public.to_dict_obj({"profile_b64": target.get("profile_b64")}))
+        target["consumed"] = True
+        target["status"] = "consumed" if resp.get("status") else "failed"
+        self._audit(data, "replica_accept_handshake", {"token": token, "status": target["status"]})
+        self._save_config(data)
+        return resp
+
+    def handshake_status(self, get):
+        if not hasattr(get, "token"):
+            return public.returnMsg(False, "missing parameter: token")
+        token = str(get.token).strip()
+        data = self._load_config()
+        for s in data.get("handshake_sessions", []):
+            if s.get("token") == token:
+                return public.returnMsg(True, s)
+        return public.returnMsg(False, "token not found")
+
+    def list_change_snapshots(self, get=None):
+        data = self._load_config()
+        return public.returnMsg(True, data.get("change_snapshots", []))
+
+    def rollback_snapshot(self, get):
+        if not hasattr(get, "snapshot_id"):
+            return public.returnMsg(False, "missing parameter: snapshot_id")
+        sid = str(get.snapshot_id).strip()
+        data = self._load_config()
+        target = None
+        for s in data.get("change_snapshots", []):
+            if s.get("snapshot_id") == sid:
+                target = s
+                break
+        if not target:
+            return public.returnMsg(False, "snapshot not found")
+        if target.get("category") == "master_auto_fix":
+            old = target.get("payload", {}).get("my_cnf", "")
+            if old:
+                public.WriteFile(self.mysql_cnf_path, old)
+                self._audit(data, "rollback_snapshot", {"snapshot_id": sid, "category": "master_auto_fix"})
+                self._save_config(data)
+                return public.returnMsg(True, "回滚成功，请重启MySQL生效")
+        return public.returnMsg(False, "snapshot category not supported")
+
+    def list_audit_logs(self, get=None):
+        data = self._load_config()
+        return public.returnMsg(True, data.get("audit_logs", []))
 
     def list_sources(self, get=None):
         data = self._load_config()

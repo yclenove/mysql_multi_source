@@ -5,9 +5,15 @@
   <div class="bt-w-con pd15">
     <div class="mb10">
       <button class="btn btn-success btn-sm" id="btn-health">健康检查</button>
+      <button class="btn btn-default btn-sm" id="btn-master-health">主库检测</button>
+      <button class="btn btn-default btn-sm" id="btn-master-preview">主库修复预览</button>
+      <button class="btn btn-default btn-sm" id="btn-master-fix">主库一键修复</button>
+      <button class="btn btn-default btn-sm" id="btn-master-restart">重启MySQL</button>
       <button class="btn btn-default btn-sm" id="btn-gtid">GTID状态</button>
       <button class="btn btn-default btn-sm" id="btn-overview">总览指标</button>
       <button class="btn btn-default btn-sm" id="btn-check-tools">检测工具</button>
+      <button class="btn btn-default btn-sm" id="btn-audit-logs">审计日志</button>
+      <button class="btn btn-default btn-sm" id="btn-snapshots">回滚快照</button>
       <button class="btn btn-default btn-sm" id="btn-refresh">刷新来源</button>
     </div>
 
@@ -20,6 +26,26 @@
       <input class="bt-input-text mr5" style="width: 120px;" id="repl_user" placeholder="复制账号">
       <input class="bt-input-text mr5" style="width: 120px;" id="repl_password" placeholder="复制密码">
       <button class="btn btn-sm btn-success" id="btn-add">添加</button>
+    </div>
+
+    <div class="mb15">
+      <h3 style="margin: 0 0 8px;">主从协同向导（签名文件 + API握手）</h3>
+      <input class="bt-input-text mr5" style="width: 100px;" id="pf_source_id" placeholder="source_id" value="m1">
+      <input class="bt-input-text mr5" style="width: 120px;" id="pf_channel_name" placeholder="channel" value="ch_m1">
+      <input class="bt-input-text mr5" style="width: 130px;" id="pf_master_host" placeholder="master_host">
+      <input class="bt-input-text mr5" style="width: 85px;" id="pf_master_port" placeholder="3306" value="3306">
+      <input class="bt-input-text mr5" style="width: 100px;" id="pf_repl_user" placeholder="repl_user" value="repl_user">
+      <input class="bt-input-text mr5" style="width: 110px;" id="pf_repl_password" placeholder="repl_password">
+      <button class="btn btn-sm btn-default" id="btn-export-profile">导出签名配置</button>
+      <br/><br/>
+      <textarea class="bt-input-text" id="profile_b64" style="width: 640px; height: 70px;" placeholder="profile_b64"></textarea>
+      <button class="btn btn-sm btn-default" id="btn-verify-profile">验证配置</button>
+      <button class="btn btn-sm btn-default" id="btn-import-profile">导入配置</button>
+      <br/><br/>
+      <input class="bt-input-text mr5" style="width: 360px;" id="handshake_token" placeholder="handshake token">
+      <button class="btn btn-sm btn-default" id="btn-create-handshake">创建握手</button>
+      <button class="btn btn-sm btn-default" id="btn-accept-handshake">接收握手</button>
+      <button class="btn btn-sm btn-default" id="btn-handshake-status">握手状态</button>
     </div>
 
     <div class="mb15">
@@ -130,6 +156,38 @@
         layer.msg('GTID模式: ' + res.msg.gtid_mode, { icon: res.msg.enabled ? 1 : 0 });
       });
     });
+    $('#btn-master-health').on('click', function () {
+      api('master_health_check', {}, function (res) {
+        if (!res.status) return layer.msg(res.msg || '主库检测失败', { icon: 2 });
+        var rows = (res.msg.items || []).map(function (i) {
+          return i.name + ' | ' + i.status + ' | 当前=' + i.current + ' | 期望=' + i.expected + ' | 建议=' + i.suggestion;
+        }).join('\n');
+        layer.open({ type: 1, area: ['900px', '460px'], title: '主库检测报告', content: '<div style="padding:12px;"><pre>' + rows + '</pre></div>' });
+      });
+    });
+    $('#btn-master-preview').on('click', function () {
+      api('master_auto_fix_preview', {}, function (res) {
+        if (!res.status) return layer.msg(res.msg || '预览失败', { icon: 2 });
+        var txt = 'need_restart=' + res.msg.need_restart + '\n' + (res.msg.actions || []).join('\n');
+        layer.open({ type: 1, area: ['760px', '380px'], title: '修复预览', content: '<div style="padding:12px;"><pre>' + txt + '</pre></div>' });
+      });
+    });
+    $('#btn-master-fix').on('click', function () {
+      bt.confirm({ title: '高危操作', msg: '确认执行主库自动修复？可能修改my.cnf' }, function () {
+        api('master_auto_fix_apply', {}, function (res) {
+          if (!res.status) return layer.msg(res.msg || '修复失败', { icon: 2 });
+          layer.msg('修复完成，snapshot=' + res.msg.snapshot_id + (res.msg.need_restart ? '，建议重启MySQL' : ''), { icon: 1, time: 6000 });
+        });
+      });
+    });
+    $('#btn-master-restart').on('click', function () {
+      bt.confirm({ title: '高危操作', msg: '确认重启MySQL服务？' }, function () {
+        api('master_restart_mysql', {}, function (res) {
+          if (!res.status) return layer.msg(res.msg || '重启失败', { icon: 2 });
+          layer.msg(res.msg || '重启成功', { icon: 1 });
+        });
+      });
+    });
 
     $('#btn-refresh').on('click', refreshList);
     $('#btn-check-tools').on('click', function () {
@@ -158,6 +216,24 @@
         layer.msg('总数=' + m.total_sources + ', 运行=' + m.running_sources + ', 停止=' + m.stopped_sources + ', 异常=' + m.error_sources + ', 初始化任务=' + m.bootstrap_tasks, { icon: 1, time: 6000 });
       });
     });
+    $('#btn-audit-logs').on('click', function () {
+      api('list_audit_logs', {}, function (res) {
+        if (!res.status) return layer.msg(res.msg || '获取失败', { icon: 2 });
+        var txt = (res.msg || []).map(function (a) {
+          return a.id + ' | ' + a.action + ' | ' + JSON.stringify(a.detail);
+        }).join('\n');
+        layer.open({ type: 1, area: ['900px', '460px'], title: '审计日志', content: '<div style="padding:12px;"><pre>' + (txt || '暂无日志') + '</pre></div>' });
+      });
+    });
+    $('#btn-snapshots').on('click', function () {
+      api('list_change_snapshots', {}, function (res) {
+        if (!res.status) return layer.msg(res.msg || '获取失败', { icon: 2 });
+        var txt = (res.msg || []).map(function (s) {
+          return s.snapshot_id + ' | ' + s.category + ' | ' + s.created_at;
+        }).join('\n');
+        layer.open({ type: 1, area: ['760px', '420px'], title: '回滚快照', content: '<div style="padding:12px;"><pre>' + (txt || '暂无快照') + '</pre></div>' });
+      });
+    });
 
     $('#btn-add').on('click', function () {
       var data = {
@@ -180,6 +256,55 @@
       api('set_db_mappings', { source_id: sourceId, mappings: mappings }, function (res) {
         if (!res.status) return layer.msg(res.msg || '映射保存失败', { icon: 2 });
         layer.msg('映射已保存', { icon: 1 });
+      });
+    });
+    $('#btn-export-profile').on('click', function () {
+      var data = {
+        source_id: $('#pf_source_id').val(),
+        channel_name: $('#pf_channel_name').val(),
+        master_host: $('#pf_master_host').val(),
+        master_port: $('#pf_master_port').val(),
+        repl_user: $('#pf_repl_user').val(),
+        repl_password: $('#pf_repl_password').val(),
+        db_mappings: $('#mapping_json').val()
+      };
+      api('master_export_signed_profile', data, function (res) {
+        if (!res.status) return layer.msg(res.msg || '导出失败', { icon: 2 });
+        $('#profile_b64').val(res.msg.profile_b64 || '');
+        layer.msg('导出成功 profile_id=' + res.msg.profile_id, { icon: 1 });
+      });
+    });
+    $('#btn-verify-profile').on('click', function () {
+      api('replica_verify_profile', { profile_b64: $('#profile_b64').val() }, function (res) {
+        if (!res.status) return layer.msg(res.msg || '验证失败', { icon: 2 });
+        layer.msg('验证结果: ' + (res.msg.verified ? '通过' : '失败'), { icon: res.msg.verified ? 1 : 2 });
+      });
+    });
+    $('#btn-import-profile').on('click', function () {
+      api('replica_import_profile', { profile_b64: $('#profile_b64').val() }, function (res) {
+        if (!res.status) return layer.msg(res.msg || '导入失败', { icon: 2 });
+        layer.msg(res.msg || '导入成功', { icon: 1 });
+        refreshList();
+      });
+    });
+    $('#btn-create-handshake').on('click', function () {
+      api('master_create_handshake', { profile_b64: $('#profile_b64').val() }, function (res) {
+        if (!res.status) return layer.msg(res.msg || '创建失败', { icon: 2 });
+        $('#handshake_token').val(res.msg.token || '');
+        layer.msg('握手token已生成', { icon: 1 });
+      });
+    });
+    $('#btn-accept-handshake').on('click', function () {
+      api('replica_accept_handshake', { token: $('#handshake_token').val() }, function (res) {
+        if (!res.status) return layer.msg(res.msg || '接收失败', { icon: 2 });
+        layer.msg(res.msg || '接收成功', { icon: 1 });
+        refreshList();
+      });
+    });
+    $('#btn-handshake-status').on('click', function () {
+      api('handshake_status', { token: $('#handshake_token').val() }, function (res) {
+        if (!res.status) return layer.msg(res.msg || '查询失败', { icon: 2 });
+        layer.open({ type: 1, area: ['760px', '380px'], title: '握手状态', content: '<div style="padding:12px;"><pre>' + JSON.stringify(res.msg, null, 2) + '</pre></div>' });
       });
     });
     $('#btn-create-boot').on('click', function () {
