@@ -1,144 +1,384 @@
+<style type="text/css">
+  .mms-root .mms-card {
+    background: #fff;
+    border: 1px solid #e6e8eb;
+    border-radius: 8px;
+    padding: 14px 16px 16px;
+    margin-bottom: 14px;
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+  }
+  .mms-root .mms-card-head {
+    margin-bottom: 12px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid #eef0f3;
+  }
+  .mms-root .mms-card-head h3 {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 600;
+    color: #1e293b;
+    letter-spacing: 0.02em;
+  }
+  .mms-root .mms-card-desc {
+    display: block;
+    margin-top: 6px;
+    font-size: 12px;
+    color: #64748b;
+    line-height: 1.5;
+  }
+  .mms-root .mms-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+  }
+  .mms-root .mms-toolbar .btn { margin: 0; }
+  .mms-root .mms-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px 16px;
+    align-items: flex-end;
+  }
+  .mms-root .mms-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 120px;
+  }
+  .mms-root .mms-field.mms-field--wide { min-width: 160px; flex: 1; }
+  .mms-root .mms-label {
+    font-size: 12px;
+    color: #64748b;
+    font-weight: 500;
+  }
+  .mms-root .mms-field .bt-input-text,
+  .mms-root .mms-field select.bt-input-text {
+    width: 100%;
+    max-width: 220px;
+    box-sizing: border-box;
+  }
+  .mms-root .mms-field textarea.bt-input-text {
+    width: 100%;
+    max-width: 100%;
+    box-sizing: border-box;
+    min-height: 72px;
+  }
+  .mms-root .mms-banner {
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 12px;
+    line-height: 1.5;
+    margin-bottom: 12px;
+    border: 1px solid #fde68a;
+    background: #fffbeb;
+    color: #92400e;
+  }
+  .mms-root .mms-details {
+    border: 1px solid #e6e8eb;
+    border-radius: 8px;
+    padding: 8px 14px 14px;
+    margin-bottom: 14px;
+    background: #fafbfc;
+  }
+  .mms-root .mms-details > summary {
+    cursor: pointer;
+    font-weight: 600;
+    font-size: 13px;
+    color: #334155;
+    padding: 6px 0;
+    list-style: none;
+    outline: none;
+  }
+  .mms-root .mms-details > summary::-webkit-details-marker { display: none; }
+  .mms-root .mms-details .mms-details-body { margin-top: 8px; }
+  .mms-root .mms-table-wrap {
+    border: 1px solid #e6e8eb;
+    border-radius: 8px;
+    overflow: hidden;
+    background: #fff;
+  }
+  .mms-root .mms-table-wrap .table { margin: 0; }
+  .mms-root .mms-table-wrap .table thead th {
+    background: #f8fafc;
+    border-bottom: 1px solid #e6e8eb;
+    font-size: 12px;
+    color: #475569;
+    font-weight: 600;
+  }
+  .mms-root .mms-mapping-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 10px;
+  }
+  .mms-root .mms-inline-hint {
+    font-size: 11px;
+    color: #94a3b8;
+    margin-top: 6px;
+  }
+  .mms-root details.mms-json > summary {
+    cursor: pointer;
+    color: #64748b;
+    font-size: 12px;
+    padding: 6px 0;
+  }
+  .mms-root #mapping_rows .mapping-source-db,
+  .mms-root #mapping_rows .mapping-target-db {
+    width: 100%;
+    max-width: none;
+    box-sizing: border-box;
+  }
+  .mms-root .mms-tab-pane {
+    min-height: 120px;
+    padding-bottom: 8px;
+  }
+  .mms-root .mms-tab-pane[hidden],
+  .mms-root .mms-tab-pane.is-hidden {
+    display: none !important;
+  }
+  .bt-w-main .bt-w-menu p.bgw {
+    cursor: pointer;
+    transition: background 0.15s ease;
+  }
+  .bt-w-main .bt-w-menu p.bgw.on,
+  .bt-w-main .bt-w-menu p.bgw.active {
+    background: #e8f4ff;
+    color: #006ad4;
+    font-weight: 600;
+    border-left: 3px solid #20a53a;
+    padding-left: 11px;
+  }
+</style>
+
 <div class="bt-w-main">
   <div class="bt-w-menu">
-    <p class="bgw">多源管理</p>
+    <p class="bgw on" data-mms-tab="0" title="从库日常：快捷操作与来源列表">工作台</p>
+    <p class="bgw" data-mms-tab="1" title="新来源、连通性、库映射">来源与映射</p>
+    <p class="bgw" data-mms-tab="2" title="初始化、物理工具、压测">初始化与工具</p>
+    <p class="bgw" data-mms-tab="3" title="主库本机运维与协同">主库与协同</p>
   </div>
-  <div class="bt-w-con pd15">
-    <div class="mb10">
-      <button class="btn btn-success btn-sm" id="btn-health">健康检查</button>
-      <button class="btn btn-default btn-sm" id="btn-master-health">主库检测</button>
-      <button class="btn btn-default btn-sm" id="btn-master-preview">主库修复预览</button>
-      <button class="btn btn-default btn-sm" id="btn-master-fix">主库一键修复</button>
-      <label style="margin-left:8px;font-weight:normal;">
-        <input type="checkbox" id="master_fix_auto_restart" style="vertical-align:middle;"> 修复后自动重启MySQL
-      </label>
-      <button class="btn btn-default btn-sm" id="btn-master-restart">重启MySQL</button>
-      <button class="btn btn-default btn-sm" id="btn-gtid">GTID状态</button>
-      <button class="btn btn-default btn-sm" id="btn-overview">总览指标</button>
-      <button class="btn btn-default btn-sm" id="btn-check-tools">检测工具</button>
-      <button class="btn btn-default btn-sm" id="btn-audit-logs">审计日志</button>
-      <button class="btn btn-default btn-sm" id="btn-snapshots">回滚快照</button>
-      <button class="btn btn-default btn-sm" id="btn-refresh">刷新来源</button>
+  <div class="bt-w-con pd15 mms-root plugin_body">
+    <!-- 工作台：从库日常 -->
+    <div class="mms-tab-pane" data-mms-tab="0">
+      <div class="mms-card">
+        <div class="mms-card-head">
+          <h3>从库 · 常用操作</h3>
+          <span class="mms-card-desc">在<strong>从库服务器</strong>打开本插件：体检、刷新列表与工具探测。</span>
+        </div>
+        <div class="mms-toolbar">
+          <button class="btn btn-success btn-sm" id="btn-health">健康检查</button>
+          <button class="btn btn-default btn-sm" id="btn-refresh">刷新来源</button>
+          <button class="btn btn-default btn-sm" id="btn-overview">总览指标</button>
+          <button class="btn btn-default btn-sm" id="btn-gtid">GTID状态</button>
+          <button class="btn btn-default btn-sm" id="btn-check-tools">检测工具</button>
+        </div>
+      </div>
+      <div class="mms-card">
+        <div class="mms-card-head">
+          <h3>复制来源列表</h3>
+          <span class="mms-card-desc">行内可启停通道、看连通性与诊断。新来源请到「来源与映射」页添加。</span>
+        </div>
+        <div class="mms-table-wrap">
+          <table class="table table-hover">
+            <thead>
+              <tr>
+                <th>来源ID</th>
+                <th>通道</th>
+                <th>主库</th>
+                <th>状态</th>
+                <th style="min-width:220px;">操作</th>
+              </tr>
+            </thead>
+            <tbody id="source_rows">
+              <tr><td colspan="5" style="text-align:center;color:#94a3b8;">暂无数据</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
 
-    <div class="mb15">
-      <h3 style="margin: 0 0 8px;">主库自动修复增强（含复制账号）</h3>
-      <input class="bt-input-text mr5" style="width: 120px;" id="master_repl_user" placeholder="repl_user" value="repl_user">
-      <input class="bt-input-text mr5" style="width: 130px;" id="master_repl_password" placeholder="repl_password">
-      <input class="bt-input-text mr5" style="width: 120px;" id="master_replica_host" placeholder="replica_host" value="%">
-      <button class="btn btn-sm btn-default" id="btn-master-create-user">仅创建复制账号</button>
-      <button class="btn btn-sm btn-default" id="btn-master-connect-test">连接测试向导</button>
+    <!-- 来源与映射 -->
+    <div class="mms-tab-pane is-hidden" data-mms-tab="1">
+      <div class="mms-card">
+        <div class="mms-card-head">
+          <h3>添加主库来源</h3>
+          <span class="mms-card-desc">每个上游主库一条来源；通道名一经使用勿重复。</span>
+        </div>
+        <div class="mms-grid">
+          <div class="mms-field"><span class="mms-label">来源 ID</span><input class="bt-input-text" id="source_id" placeholder="如 m1"></div>
+          <div class="mms-field"><span class="mms-label">通道名</span><input class="bt-input-text" id="channel_name" placeholder="如 ch_m1"></div>
+          <div class="mms-field mms-field--wide"><span class="mms-label">主库地址</span><input class="bt-input-text" id="master_host" placeholder="IP 或域名"></div>
+          <div class="mms-field"><span class="mms-label">端口</span><input class="bt-input-text" id="master_port" placeholder="3306" value="3306"></div>
+          <div class="mms-field"><span class="mms-label">复制账号</span><input class="bt-input-text" id="repl_user" placeholder="repl 用户"></div>
+          <div class="mms-field"><span class="mms-label">复制密码</span><input class="bt-input-text" id="repl_password" type="password" placeholder="密码" autocomplete="off"></div>
+          <div class="mms-field" style="justify-content:flex-end;">
+            <span class="mms-label">&nbsp;</span>
+            <button class="btn btn-success btn-sm" id="btn-add">添加来源</button>
+          </div>
+        </div>
+      </div>
+      <div class="mms-card">
+        <div class="mms-card-head">
+          <h3>连通性校验</h3>
+          <span class="mms-card-desc">使用本页「主库地址」或下方「主从协同」里的地址；密码优先本页复制账号/密码。</span>
+        </div>
+        <div class="mms-toolbar">
+          <button class="btn btn-success btn-sm" id="btn-master-connect-test">连接测试向导</button>
+        </div>
+      </div>
+      <div class="mms-card">
+        <div class="mms-card-head">
+          <h3>库映射</h3>
+          <span class="mms-card-desc">主库库名映射到本实例目标库；可多条。</span>
+        </div>
+        <div class="mms-mapping-actions">
+          <div class="mms-field" style="min-width:140px;"><span class="mms-label">来源 ID</span><input class="bt-input-text" id="mapping_source_id" placeholder="对应已添加来源"></div>
+          <button class="btn btn-default btn-sm" id="btn-load-mapping">载入已有</button>
+          <button class="btn btn-default btn-sm" id="btn-add-mapping-row">添加一行</button>
+          <button class="btn btn-success btn-sm" id="btn-set-mapping">保存映射</button>
+        </div>
+        <div class="mms-table-wrap">
+          <table class="table table-hover">
+            <thead>
+              <tr>
+                <th style="min-width:160px;">主库库名（source_db）</th>
+                <th style="min-width:160px;">从库目标库名（target_db）</th>
+                <th style="width:72px;">操作</th>
+              </tr>
+            </thead>
+            <tbody id="mapping_rows"></tbody>
+          </table>
+        </div>
+        <details class="mms-json">
+          <summary>高级：JSON 预览（只读）</summary>
+          <textarea class="bt-input-text" id="mapping_json" readonly placeholder="[]" style="width:100%; margin-top:8px; background:#f8fafc;"></textarea>
+        </details>
+      </div>
     </div>
 
-    <div class="mb15">
-      <h3 style="margin: 0 0 8px;">添加主库来源</h3>
-      <input class="bt-input-text mr5" style="width: 120px;" id="source_id" placeholder="来源ID">
-      <input class="bt-input-text mr5" style="width: 120px;" id="channel_name" placeholder="通道名">
-      <input class="bt-input-text mr5" style="width: 140px;" id="master_host" placeholder="主库地址">
-      <input class="bt-input-text mr5" style="width: 90px;" id="master_port" placeholder="3306" value="3306">
-      <input class="bt-input-text mr5" style="width: 120px;" id="repl_user" placeholder="复制账号">
-      <input class="bt-input-text mr5" style="width: 120px;" id="repl_password" placeholder="复制密码">
-      <button class="btn btn-sm btn-success" id="btn-add">添加</button>
+    <!-- 初始化与工具 -->
+    <div class="mms-tab-pane is-hidden" data-mms-tab="2">
+      <div class="mms-card">
+        <div class="mms-card-head">
+          <h3>初始化任务</h3>
+          <span class="mms-card-desc">大库建议 auto；创建后填入任务 ID 再后台执行。</span>
+        </div>
+        <div class="mms-grid">
+          <div class="mms-field"><span class="mms-label">来源 ID</span><input class="bt-input-text" id="boot_source_id" placeholder="来源ID"></div>
+          <div class="mms-field"><span class="mms-label">模式</span>
+            <select class="bt-input-text" id="boot_mode">
+              <option value="auto">auto</option>
+              <option value="physical">physical</option>
+              <option value="logical">logical</option>
+            </select>
+          </div>
+          <div class="mms-field"><span class="mms-label">&nbsp;</span><button class="btn btn-default btn-sm" id="btn-create-boot">创建任务</button></div>
+          <div class="mms-field mms-field--wide"><span class="mms-label">任务 ID</span><input class="bt-input-text" id="boot_task_id" placeholder="粘贴返回的任务ID" style="max-width:280px;"></div>
+          <div class="mms-field"><span class="mms-label">&nbsp;</span><button class="btn btn-default btn-sm" id="btn-run-boot">后台执行</button></div>
+          <div class="mms-field"><span class="mms-label">&nbsp;</span><button class="btn btn-default btn-sm" id="btn-cancel-boot">取消任务</button></div>
+          <div class="mms-field"><span class="mms-label">&nbsp;</span><button class="btn btn-default btn-sm" id="btn-task-detail">任务详情</button></div>
+          <div class="mms-field"><span class="mms-label">&nbsp;</span><button class="btn btn-default btn-sm" id="btn-task-log">任务日志</button></div>
+          <div class="mms-field"><span class="mms-label">&nbsp;</span><button class="btn btn-default btn-sm" id="btn-list-boot">任务列表</button></div>
+        </div>
+      </div>
+      <div class="mms-card">
+        <div class="mms-card-head">
+          <h3>物理工具安装助手</h3>
+          <span class="mms-card-desc">大库初始化优先 xtrabackup / mariabackup；需 root 时按提示操作。</span>
+        </div>
+        <div class="mms-toolbar">
+          <select class="bt-input-text" id="tool_name" style="width:160px;">
+            <option value="xtrabackup">xtrabackup</option>
+            <option value="mariabackup">mariabackup</option>
+          </select>
+          <button class="btn btn-default btn-sm" id="btn-install-tool">一键安装</button>
+          <button class="btn btn-default btn-sm" id="btn-install-tool-retry">安装重试</button>
+          <button class="btn btn-default btn-sm" id="btn-copy-tool-cmd">复制安装命令</button>
+          <button class="btn btn-default btn-sm" id="btn-tool-log">安装日志</button>
+        </div>
+      </div>
+      <div class="mms-card">
+        <div class="mms-card-head">
+          <h3>压测向导（可选）</h3>
+          <span class="mms-card-desc">用于批量创建初始化任务并观察指标，生产环境慎用。</span>
+        </div>
+        <div class="mms-toolbar">
+          <input class="bt-input-text" id="stress_source_count" placeholder="来源数" value="1" style="width:100px;">
+          <input class="bt-input-text" id="stress_task_per_source" placeholder="每来源任务数" value="2" style="width:120px;">
+          <select class="bt-input-text" id="stress_mode" style="width:120px;">
+            <option value="auto">auto</option>
+            <option value="logical">logical</option>
+            <option value="physical">physical</option>
+          </select>
+          <button class="btn btn-default btn-sm" id="btn-stress-run">开始压测</button>
+          <button class="btn btn-default btn-sm" id="btn-stress-report">压测报告</button>
+        </div>
+      </div>
     </div>
 
-    <div class="mb15">
-      <h3 style="margin: 0 0 8px;">主从协同向导（签名文件 + API握手）</h3>
-      <input class="bt-input-text mr5" style="width: 100px;" id="pf_source_id" placeholder="source_id" value="m1">
-      <input class="bt-input-text mr5" style="width: 120px;" id="pf_channel_name" placeholder="channel" value="ch_m1">
-      <input class="bt-input-text mr5" style="width: 130px;" id="pf_master_host" placeholder="master_host">
-      <input class="bt-input-text mr5" style="width: 85px;" id="pf_master_port" placeholder="3306" value="3306">
-      <input class="bt-input-text mr5" style="width: 100px;" id="pf_repl_user" placeholder="repl_user" value="repl_user">
-      <input class="bt-input-text mr5" style="width: 110px;" id="pf_repl_password" placeholder="repl_password">
-      <button class="btn btn-sm btn-default" id="btn-export-profile">导出签名配置</button>
-      <br/><br/>
-      <textarea class="bt-input-text" id="profile_b64" style="width: 640px; height: 70px;" placeholder="profile_b64"></textarea>
-      <button class="btn btn-sm btn-default" id="btn-verify-profile">验证配置</button>
-      <button class="btn btn-sm btn-default" id="btn-import-profile">导入配置</button>
-      <br/><br/>
-      <input class="bt-input-text mr5" style="width: 360px;" id="handshake_token" placeholder="handshake token">
-      <button class="btn btn-sm btn-default" id="btn-create-handshake">创建握手</button>
-      <button class="btn btn-sm btn-default" id="btn-accept-handshake">接收握手</button>
-      <button class="btn btn-sm btn-default" id="btn-handshake-status">握手状态</button>
+    <!-- 主库与协同 -->
+    <div class="mms-tab-pane is-hidden" data-mms-tab="3">
+      <div class="mms-banner">以下「主库检测 / 修复 / 重启」等仅在<strong>当前宝塔所在机器</strong>的 MySQL 上生效。请先在<strong>主库服务器</strong>打开本插件再操作。连接性测试请在「来源与映射」页。</div>
+      <div class="mms-card" style="border:1px dashed #cbd5e1;">
+        <div class="mms-card-head">
+          <h3>复制账号（主库侧）</h3>
+          <span class="mms-card-desc">在主库本机执行创建复制用户，或点此按钮由插件执行 SQL。</span>
+        </div>
+        <div class="mms-grid">
+          <div class="mms-field"><span class="mms-label">repl 用户</span><input class="bt-input-text" id="master_repl_user" value="repl_user"></div>
+          <div class="mms-field"><span class="mms-label">密码</span><input class="bt-input-text" id="master_repl_password" type="password" placeholder="repl 密码" autocomplete="off"></div>
+          <div class="mms-field"><span class="mms-label">允许来源 host</span><input class="bt-input-text" id="master_replica_host" value="%"></div>
+          <div class="mms-field"><span class="mms-label">&nbsp;</span><button class="btn btn-default btn-sm" id="btn-master-create-user">仅创建复制账号</button></div>
+        </div>
+      </div>
+      <div class="mms-card">
+        <div class="mms-card-head">
+          <h3>主库检测与修复</h3>
+        </div>
+        <div class="mms-toolbar">
+          <button class="btn btn-default btn-sm" id="btn-master-health">主库检测</button>
+          <button class="btn btn-default btn-sm" id="btn-master-preview">修复预览</button>
+          <button class="btn btn-warning btn-sm" id="btn-master-fix">主库一键修复</button>
+          <label class="mms-label" style="display:inline-flex;align-items:center;gap:6px;margin:0 8px;">
+            <input type="checkbox" id="master_fix_auto_restart"> <span>修复后自动重启</span>
+          </label>
+          <button class="btn btn-danger btn-sm" id="btn-master-restart">重启 MySQL</button>
+          <button class="btn btn-default btn-sm" id="btn-audit-logs">审计日志</button>
+          <button class="btn btn-default btn-sm" id="btn-snapshots">回滚快照</button>
+        </div>
+      </div>
+      <div class="mms-card">
+        <div class="mms-card-head">
+          <h3>主从协同向导（签名 + 握手）</h3>
+          <span class="mms-card-desc">主库导出、从库导入；或用手 token 完成一次性配置同步。</span>
+        </div>
+        <div class="mms-grid">
+          <div class="mms-field"><span class="mms-label">source_id</span><input class="bt-input-text" id="pf_source_id" value="m1"></div>
+          <div class="mms-field"><span class="mms-label">channel</span><input class="bt-input-text" id="pf_channel_name" value="ch_m1"></div>
+          <div class="mms-field mms-field--wide"><span class="mms-label">master_host</span><input class="bt-input-text" id="pf_master_host" placeholder="主库地址"></div>
+          <div class="mms-field"><span class="mms-label">端口</span><input class="bt-input-text" id="pf_master_port" value="3306"></div>
+          <div class="mms-field"><span class="mms-label">repl 用户</span><input class="bt-input-text" id="pf_repl_user" value="repl_user"></div>
+          <div class="mms-field"><span class="mms-label">repl 密码</span><input class="bt-input-text" id="pf_repl_password" type="password" placeholder="密码" autocomplete="off"></div>
+          <div class="mms-field"><span class="mms-label">&nbsp;</span><button class="btn btn-default btn-sm" id="btn-export-profile">导出签名配置</button></div>
+        </div>
+        <div class="mms-field mms-field--wide" style="max-width:100%;margin-top:10px;">
+          <span class="mms-label">profile_b64</span>
+          <textarea class="bt-input-text" id="profile_b64" placeholder="导出后出现 Base64，或粘贴从主库获得的配置"></textarea>
+        </div>
+        <div class="mms-toolbar" style="margin-top:8px;">
+          <button class="btn btn-default btn-sm" id="btn-verify-profile">验证配置</button>
+          <button class="btn btn-success btn-sm" id="btn-import-profile">导入配置</button>
+        </div>
+        <div class="mms-grid" style="margin-top:12px;">
+          <div class="mms-field mms-field--wide"><span class="mms-label">handshake token</span><input class="bt-input-text" id="handshake_token" placeholder="握手 token" style="max-width:100%;"></div>
+          <div class="mms-field"><span class="mms-label">&nbsp;</span><button class="btn btn-default btn-sm" id="btn-create-handshake">创建握手</button></div>
+          <div class="mms-field"><span class="mms-label">&nbsp;</span><button class="btn btn-default btn-sm" id="btn-accept-handshake">接收握手</button></div>
+          <div class="mms-field"><span class="mms-label">&nbsp;</span><button class="btn btn-default btn-sm" id="btn-handshake-status">握手状态</button></div>
+        </div>
+      </div>
     </div>
 
-    <div class="mb15">
-      <h3 style="margin: 0 0 8px;">库映射配置</h3>
-      <p class="muted" style="color:#888;font-size:12px;margin:0 0 8px;">填写「主库库名 → 从库目标库名」即可，无需手写 JSON；高级用户可展开 JSON 查看。</p>
-      <input class="bt-input-text mr5" style="width: 140px;" id="mapping_source_id" placeholder="来源ID">
-      <button class="btn btn-sm btn-default" id="btn-load-mapping">载入已有映射</button>
-      <button class="btn btn-sm btn-default" id="btn-add-mapping-row">添加一行</button>
-      <button class="btn btn-sm btn-success" id="btn-set-mapping">保存映射</button>
-      <table class="table table-hover" style="max-width:640px;margin-top:10px;">
-        <thead>
-          <tr>
-            <th>主库库名（source_db）</th>
-            <th>从库目标库名（target_db）</th>
-            <th style="width:70px;">操作</th>
-          </tr>
-        </thead>
-        <tbody id="mapping_rows"></tbody>
-      </table>
-      <details style="margin-top:8px;">
-        <summary style="cursor:pointer;color:#666;">高级：JSON 预览（只读，保存时自动生成）</summary>
-        <textarea class="bt-input-text" id="mapping_json" readonly style="width: 640px; height: 72px; margin-top:6px; background:#fafafa;" placeholder="[]"></textarea>
-      </details>
-    </div>
-
-    <div class="mb15">
-      <h3 style="margin: 0 0 8px;">初始化任务</h3>
-      <input class="bt-input-text mr5" style="width: 140px;" id="boot_source_id" placeholder="来源ID">
-      <select class="bt-input-text mr5" id="boot_mode" style="width: 120px;">
-        <option value="auto">auto</option>
-        <option value="physical">physical</option>
-        <option value="logical">logical</option>
-      </select>
-      <button class="btn btn-sm btn-default" id="btn-create-boot">创建任务</button>
-      <input class="bt-input-text mr5" style="width: 160px;" id="boot_task_id" placeholder="任务ID">
-      <button class="btn btn-sm btn-default" id="btn-run-boot">后台执行</button>
-      <button class="btn btn-sm btn-default" id="btn-cancel-boot">取消任务</button>
-      <button class="btn btn-sm btn-default" id="btn-task-detail">任务详情</button>
-      <button class="btn btn-sm btn-default" id="btn-task-log">任务日志</button>
-      <button class="btn btn-sm btn-default" id="btn-list-boot">查看任务</button>
-    </div>
-
-    <div class="mb15">
-      <h3 style="margin: 0 0 8px;">物理工具安装助手</h3>
-      <select class="bt-input-text mr5" id="tool_name" style="width: 160px;">
-        <option value="xtrabackup">xtrabackup</option>
-        <option value="mariabackup">mariabackup</option>
-      </select>
-      <button class="btn btn-sm btn-default" id="btn-install-tool">一键安装</button>
-      <button class="btn btn-sm btn-default" id="btn-install-tool-retry">安装重试</button>
-      <button class="btn btn-sm btn-default" id="btn-copy-tool-cmd">复制安装命令</button>
-      <button class="btn btn-sm btn-default" id="btn-tool-log">安装日志</button>
-    </div>
-
-    <div class="mb15">
-      <h3 style="margin: 0 0 8px;">压测向导（UI）</h3>
-      <input class="bt-input-text mr5" style="width: 120px;" id="stress_source_count" placeholder="来源数" value="1">
-      <input class="bt-input-text mr5" style="width: 120px;" id="stress_task_per_source" placeholder="每来源任务数" value="2">
-      <select class="bt-input-text mr5" id="stress_mode" style="width: 120px;">
-        <option value="auto">auto</option>
-        <option value="logical">logical</option>
-        <option value="physical">physical</option>
-      </select>
-      <button class="btn btn-sm btn-default" id="btn-stress-run">开始压测</button>
-      <button class="btn btn-sm btn-default" id="btn-stress-report">查看压测报告</button>
-    </div>
-
-    <table class="table table-hover">
-      <thead>
-        <tr>
-          <th>来源ID</th>
-          <th>通道</th>
-          <th>主库</th>
-          <th>状态</th>
-          <th>操作</th>
-        </tr>
-      </thead>
-      <tbody id="source_rows">
-        <tr><td colspan="5">暂无数据</td></tr>
-      </tbody>
-    </table>
   </div>
 </div>
 
@@ -152,6 +392,42 @@
         cb && cb(res);
       });
     }
+
+    function mmsSetTab(index) {
+      var n = parseInt(index, 10);
+      if (isNaN(n) || n < 0 || n > 3) n = 0;
+      $('.bt-w-main .bt-w-menu .bgw').removeClass('on active');
+      $('.bt-w-main .bt-w-menu .bgw[data-mms-tab="' + n + '"]').addClass('on');
+      $('.mms-tab-pane').each(function () {
+        var t = parseInt($(this).attr('data-mms-tab'), 10);
+        if (t === n) {
+          $(this).removeClass('is-hidden');
+        } else {
+          $(this).addClass('is-hidden');
+        }
+      });
+      try {
+        sessionStorage.setItem('mms_active_tab', String(n));
+      } catch (e) {}
+    }
+
+    function mmsInitTab() {
+      var saved = null;
+      try {
+        saved = sessionStorage.getItem('mms_active_tab');
+      } catch (e) {}
+      if (saved !== null && saved !== '' && !isNaN(parseInt(saved, 10))) {
+        mmsSetTab(saved);
+      } else {
+        mmsSetTab(0);
+      }
+    }
+
+    $('.bt-w-main .bt-w-menu .bgw').on('click', function () {
+      var idx = $(this).attr('data-mms-tab');
+      if (idx === undefined || idx === '') return;
+      mmsSetTab(idx);
+    });
 
     function collectMappingsFromForm() {
       var list = [];
@@ -172,9 +448,9 @@
     function appendMappingRow(sourceDb, targetDb) {
       var tr = $(
         '<tr>' +
-          '<td><input type="text" class="bt-input-text mapping-source-db" style="width:200px;" placeholder="例如 order_db" value="' +
+          '<td><input type="text" class="bt-input-text mapping-source-db" placeholder="例如 order_db" value="' +
           (sourceDb ? $('<div/>').text(sourceDb).html() : '') + '"></td>' +
-          '<td><input type="text" class="bt-input-text mapping-target-db" style="width:200px;" placeholder="例如 m1_order_db" value="' +
+          '<td><input type="text" class="bt-input-text mapping-target-db" placeholder="例如 m1_order_db" value="' +
           (targetDb ? $('<div/>').text(targetDb).html() : '') + '"></td>' +
           '<td><a href="javascript:;" class="btlink mapping-remove-row">删除</a></td>' +
         '</tr>'
@@ -227,7 +503,7 @@
     function renderRows(list) {
       var rows = '';
       if (!list || !list.length) {
-        $('#source_rows').html('<tr><td colspan="5">暂无数据</td></tr>');
+        $('#source_rows').html('<tr><td colspan="5" style="text-align:center;color:#94a3b8;">暂无数据</td></tr>');
         return;
       }
       list.forEach(function (item) {
@@ -605,20 +881,20 @@
       });
     });
 
-    $('.plugin_body').off('click', '.source-start').on('click', '.source-start', function () {
+    $('.mms-root').off('click', '.source-start').on('click', '.source-start', function () {
       api('start_channel', { source_id: $(this).data('id') }, function (res) {
         if (!res.status) return layer.msg(res.msg || '启动失败', { icon: 2 });
         refreshList();
       });
     });
 
-    $('.plugin_body').off('click', '.source-stop').on('click', '.source-stop', function () {
+    $('.mms-root').off('click', '.source-stop').on('click', '.source-stop', function () {
       api('stop_channel', { source_id: $(this).data('id') }, function (res) {
         if (!res.status) return layer.msg(res.msg || '停止失败', { icon: 2 });
         refreshList();
       });
     });
-    $('.plugin_body').off('click', '.source-test').on('click', '.source-test', function () {
+    $('.mms-root').off('click', '.source-test').on('click', '.source-test', function () {
       api('test_source_connection', { source_id: $(this).data('id') }, function (res) {
         var msg = res.msg;
         if (typeof msg === 'object') {
@@ -628,7 +904,7 @@
         }
       });
     });
-    $('.plugin_body').off('click', '.source-status').on('click', '.source-status', function () {
+    $('.mms-root').off('click', '.source-status').on('click', '.source-status', function () {
       api('channel_status', { source_id: $(this).data('id') }, function (res) {
         if (!res.status) return layer.msg(res.msg || '状态获取失败', { icon: 2 });
         var msg = 'IO=' + res.msg.io_running + ', SQL=' + res.msg.sql_running + ', 延迟=' + res.msg.seconds_behind;
@@ -637,7 +913,7 @@
         refreshList();
       });
     });
-    $('.plugin_body').off('click', '.source-diagnose').on('click', '.source-diagnose', function () {
+    $('.mms-root').off('click', '.source-diagnose').on('click', '.source-diagnose', function () {
       api('diagnose_source', { source_id: $(this).data('id') }, function (res) {
         if (!res.status) return layer.msg(res.msg || '诊断失败', { icon: 2 });
         var d = res.msg;
@@ -654,7 +930,7 @@
         });
       });
     });
-    $('.plugin_body').off('click', '.source-log').on('click', '.source-log', function () {
+    $('.mms-root').off('click', '.source-log').on('click', '.source-log', function () {
       api('get_source_logs', { source_id: $(this).data('id') }, function (res) {
         if (!res.status) return layer.msg(res.msg || '日志获取失败', { icon: 2 });
         layer.open({
@@ -666,7 +942,7 @@
       });
     });
 
-    $('.plugin_body').off('click', '.source-delete').on('click', '.source-delete', function () {
+    $('.mms-root').off('click', '.source-delete').on('click', '.source-delete', function () {
       var sourceId = $(this).data('id');
       bt.confirm({
         title: '删除来源',
@@ -679,6 +955,7 @@
       });
     });
 
+    mmsInitTab();
     ensureMappingRowsInitialized();
     syncMappingJsonPreview();
     refreshList();
