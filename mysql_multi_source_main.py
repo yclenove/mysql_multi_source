@@ -13,6 +13,10 @@ import hashlib
 import hmac
 import base64
 import copy
+import shlex
+import subprocess
+import contextlib
+import threading
 
 if "/www/server/panel/class" not in sys.path:
     sys.path.insert(0, "/www/server/panel/class")
@@ -22,14 +26,31 @@ if "/www/server/panel" not in sys.path:
 import public
 import db_mysql
 
+try:
+    import fcntl as _fcntl
+except Exception:
+    _fcntl = None
+
+try:
+    from cryptography.fernet import Fernet, InvalidToken as _FernetInvalid
+    _HAS_FERNET = True
+except Exception:
+    _HAS_FERNET = False
+    _FernetInvalid = Exception
+
 
 class mysql_multi_source_main:
     config_path = "/www/server/panel/plugin/mysql_multi_source/multi_source_info.json"
+    config_lock_path = "/www/server/panel/plugin/mysql_multi_source/multi_source_info.lock"
     log_dir = "/www/server/panel/plugin/mysql_multi_source/log"
     bootstrap_root = "/www/server/panel/plugin/mysql_multi_source/bootstrap_data"
     task_stale_timeout = 120
     sign_secret_path = "/www/server/panel/plugin/mysql_multi_source/profile_sign.key"
+    crypto_key_path = "/www/server/panel/plugin/mysql_multi_source/secret.key"
     mysql_cnf_path = "/etc/my.cnf"
+    plugin_root = "/www/server/panel/plugin/mysql_multi_source"
+    CONFIG_SCHEMA_VERSION = "2.0.0"
+    CRYPTO_PREFIX = "enc:v1:"
 
     def __init__(self):
         pass
@@ -37,14 +58,157 @@ class mysql_multi_source_main:
     def _mysql(self):
         return db_mysql.panelMysql()
 
+    # === basic escaping ===
+
     def _sql_escape(self, value):
+        """Conservative escaping for literals embedded in SQL string."""
         return str(value).replace("\\", "\\\\").replace("'", "\\'")
+
+    def _shell_quote(self, value):
+        """Safe shell quoting via shlex; use for every shell interpolation."""
+        return shlex.quote(str(value))
+
+    def _mysql_password_literal(self, password):
+        """Encode password as MySQL hex literal to avoid quoting pitfalls.
+
+        Produces a form like X'48656C6C6F' which works in IDENTIFIED BY VALUES
+        contexts; for IDENTIFIED BY we must still use a quoted string, so we
+        keep this helper available and fall back to CREATE USER with
+        parameterized style in callers.
+        """
+        raw = str(password).encode("utf-8")
+        return "0x" + raw.hex().upper()
+
+    # === validators (regex previously had \\s which was literal backslash-s) ===
 
     def _validate_channel_name(self, channel_name):
         return re.match(r"^[A-Za-z0-9_]{1,64}$", channel_name or "") is not None
 
     def _validate_source_id(self, source_id):
-        return re.match(r"^[A-Za-z0-9_\\-]{1,64}$", source_id or "") is not None
+        return re.match(r"^[A-Za-z0-9_\-]{1,64}$", source_id or "") is not None
+
+    def _validate_mysql_scope_name(self, value):
+        return re.match(r"^[A-Za-z0-9_\-$]+$", value or "") is not None
+
+    def _validate_privileges_text(self, value):
+        return re.match(r"^[A-Za-z_,\s]+$", value or "") is not None
+
+    # === crypto: encrypt at rest for replication passwords ===
+
+    def _crypto_key(self):
+        """Lazily fetch or create a crypto key file (chmod 600)."""
+        self._ensure_dirs()
+        if os.path.exists(self.crypto_key_path):
+            raw = public.ReadFile(self.crypto_key_path) or ""
+            key = raw.strip()
+            if key:
+                return key.encode("utf-8")
+        if _HAS_FERNET:
+            key = Fernet.generate_key().decode("utf-8")
+        else:
+            key = base64.urlsafe_b64encode(os.urandom(32)).decode("utf-8")
+        public.WriteFile(self.crypto_key_path, key)
+        try:
+            os.chmod(self.crypto_key_path, 0o600)
+        except Exception:
+            pass
+        return key.encode("utf-8")
+
+    def _crypto_encrypt(self, plaintext):
+        if plaintext is None or plaintext == "":
+            return ""
+        text = str(plaintext)
+        if text.startswith(self.CRYPTO_PREFIX):
+            return text
+        if _HAS_FERNET:
+            try:
+                token = Fernet(self._crypto_key()).encrypt(text.encode("utf-8")).decode("utf-8")
+                return self.CRYPTO_PREFIX + token
+            except Exception:
+                pass
+        # Fallback: XOR-stream with key-derived bytes (obfuscation only)
+        key = hashlib.sha256(self._crypto_key()).digest()
+        raw = text.encode("utf-8")
+        out = bytes(b ^ key[i % len(key)] for i, b in enumerate(raw))
+        return self.CRYPTO_PREFIX + "xor:" + base64.urlsafe_b64encode(out).decode("utf-8")
+
+    def _crypto_decrypt(self, value):
+        if value is None or value == "":
+            return ""
+        text = str(value)
+        if not text.startswith(self.CRYPTO_PREFIX):
+            return text
+        body = text[len(self.CRYPTO_PREFIX):]
+        if body.startswith("xor:"):
+            key = hashlib.sha256(self._crypto_key()).digest()
+            raw = base64.urlsafe_b64decode(body[4:].encode("utf-8"))
+            out = bytes(b ^ key[i % len(key)] for i, b in enumerate(raw))
+            return out.decode("utf-8", errors="replace")
+        if _HAS_FERNET:
+            try:
+                return Fernet(self._crypto_key()).decrypt(body.encode("utf-8")).decode("utf-8")
+            except Exception:
+                return ""
+        return ""
+
+    # === file lock: atomic read/modify/write of config ===
+
+    @contextlib.contextmanager
+    def _with_lock(self):
+        self._ensure_dirs()
+        fp = None
+        if _fcntl is not None:
+            try:
+                fp = open(self.config_lock_path, "a+")
+                _fcntl.flock(fp.fileno(), _fcntl.LOCK_EX)
+            except Exception:
+                fp = None
+        try:
+            yield
+        finally:
+            if fp is not None:
+                try:
+                    _fcntl.flock(fp.fileno(), _fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                try:
+                    fp.close()
+                except Exception:
+                    pass
+
+    # === subprocess: run shell with env, no password in argv ===
+
+    def _run_shell(self, cmd, env_extra=None, timeout=1800, cwd=None, shell=False):
+        """Run a command returning {code, stdout, stderr}.
+
+        When shell=False, cmd must be a list. When shell=True, cmd is a string
+        that must already be properly quoted by the caller (use _shell_quote).
+        Passwords must be passed via env_extra; never embed in cmd.
+        """
+        env = os.environ.copy()
+        if env_extra:
+            for k, v in env_extra.items():
+                env[k] = str(v)
+        try:
+            p = subprocess.Popen(
+                cmd,
+                shell=shell,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                cwd=cwd,
+                universal_newlines=True,
+            )
+            stdout, stderr = p.communicate(timeout=timeout)
+            return {"code": int(p.returncode or 0), "stdout": stdout or "", "stderr": stderr or ""}
+        except subprocess.TimeoutExpired:
+            try:
+                p.kill()
+            except Exception:
+                pass
+            return {"code": 124, "stdout": "", "stderr": "command timeout after {}s".format(timeout)}
+        except Exception as ex:
+            return {"code": 1, "stdout": "", "stderr": str(ex)}
 
     def _ok(self, data=None, message="ok", code="OK"):
         payload = data if data is not None else {}
@@ -65,7 +229,10 @@ class mysql_multi_source_main:
 
     def _query_sql(self, sql):
         mysql_obj = self._mysql()
-        return mysql_obj.query(sql)
+        result = mysql_obj.query(sql)
+        if not isinstance(result, (list, tuple)):
+            return []
+        return result
 
     def _append_log(self, source_id, message):
         self._ensure_dirs()
@@ -135,13 +302,14 @@ class mysql_multi_source_main:
 
     def _default_config(self):
         return {
-            "version": "1",
+            "version": self.CONFIG_SCHEMA_VERSION,
             "mode": "replica_mode",
             "slave_instance": {
                 "host": "127.0.0.1",
                 "port": 3306,
                 "updated_at": self._now(),
             },
+            "master_setup": None,
             "sources": [],
             "bootstrap_tasks": [],
             "master_profiles": [],
@@ -159,19 +327,54 @@ class mysql_multi_source_main:
         if not os.path.exists(self.bootstrap_root):
             os.makedirs(self.bootstrap_root)
 
+    def _migrate_config(self, data):
+        """Auto-encrypt any plaintext password fields and bump version."""
+        changed = False
+        if not isinstance(data, dict):
+            return data, False
+        data.setdefault("version", "1")
+
+        for src in data.get("sources", []) or []:
+            pwd = src.get("repl_password")
+            if pwd and isinstance(pwd, str) and not pwd.startswith(self.CRYPTO_PREFIX):
+                src["repl_password"] = self._crypto_encrypt(pwd)
+                changed = True
+
+        for profile in data.get("master_profiles", []) or []:
+            payload = profile.get("payload") or {}
+            pwd = payload.get("repl_password")
+            if pwd and isinstance(pwd, str) and not pwd.startswith(self.CRYPTO_PREFIX):
+                payload["repl_password"] = self._crypto_encrypt(pwd)
+                profile["payload"] = payload
+                changed = True
+
+        if str(data.get("version", "1")) != self.CONFIG_SCHEMA_VERSION:
+            data["version"] = self.CONFIG_SCHEMA_VERSION
+            changed = True
+
+        return data, changed
+
     def _load_config(self):
         self._ensure_dirs()
         if not os.path.exists(self.config_path):
             data = self._default_config()
-            public.WriteFile(self.config_path, json.dumps(data))
+            public.WriteFile(self.config_path, json.dumps(data, ensure_ascii=False))
             return data
         raw = public.ReadFile(self.config_path)
         if not raw:
             return self._default_config()
         try:
-            return json.loads(raw)
+            data = json.loads(raw)
         except Exception:
             return self._default_config()
+        # transparent migration for legacy plaintext passwords
+        data, changed = self._migrate_config(data)
+        if changed:
+            try:
+                public.WriteFile(self.config_path, json.dumps(data, ensure_ascii=False))
+            except Exception:
+                pass
+        return data
 
     def _save_config(self, data):
         data.setdefault("mode", "replica_mode")
@@ -179,8 +382,32 @@ class mysql_multi_source_main:
         data.setdefault("handshake_sessions", [])
         data.setdefault("change_snapshots", [])
         data.setdefault("audit_logs", [])
+        data.setdefault("version", self.CONFIG_SCHEMA_VERSION)
+        data.setdefault("slave_instance", {"host": "127.0.0.1", "port": 3306})
         data["slave_instance"]["updated_at"] = self._now()
-        return bool(public.WriteFile(self.config_path, json.dumps(data)))
+        # ensure encrypted-at-rest for any new sources written this round
+        for src in data.get("sources", []) or []:
+            pwd = src.get("repl_password")
+            if pwd and isinstance(pwd, str) and not pwd.startswith(self.CRYPTO_PREFIX):
+                src["repl_password"] = self._crypto_encrypt(pwd)
+        return bool(public.WriteFile(self.config_path, json.dumps(data, ensure_ascii=False)))
+
+    def _update_config(self, mutator):
+        """Atomically load → mutate → save under file lock.
+
+        mutator(data) -> return value is forwarded to caller.
+        """
+        with self._with_lock():
+            data = self._load_config()
+            ret = mutator(data)
+            self._save_config(data)
+            return ret
+
+    def _decrypted_password(self, source):
+        """Return plaintext repl_password from a source record (supports enc)."""
+        if not isinstance(source, dict):
+            return ""
+        return self._crypto_decrypt(source.get("repl_password", ""))
 
     def _audit(self, data, action, detail):
         logs = data.setdefault("audit_logs", [])
@@ -266,23 +493,105 @@ class mysql_multi_source_main:
         if tool_name not in ["xtrabackup", "mariabackup"]:
             return ""
 
-        # 尽量使用系统仓库路径，避免外部脚本安装
         if os_family == "debian":
             if tool_name == "xtrabackup":
-                return "apt-get update && apt-get install -y percona-xtrabackup-80"
-            return "apt-get update && apt-get install -y mariadb-backup"
+                return self._build_xtrabackup_install_debian()
+            return self._build_mariabackup_install_debian()
         if os_family in ["redhat", "linux"]:
             if tool_name == "xtrabackup":
-                return "yum install -y percona-xtrabackup-80 || dnf install -y percona-xtrabackup-80"
-            return "yum install -y mariadb-backup || dnf install -y mariadb-backup"
+                return self._build_xtrabackup_install_rhel()
+            return self._build_mariabackup_install_rhel()
         return ""
 
+    def _build_xtrabackup_install_debian(self):
+        # 多路回退：apt 直装 → percona-release 仓库(code-name / generic) → 再装；
+        # 同时打印每一步方便看 install.log。
+        return (
+            "set +e; "
+            "echo '[step] ensure base tools'; "
+            "export DEBIAN_FRONTEND=noninteractive; "
+            "apt-get update -y; "
+            "apt-get install -y wget gnupg2 lsb-release curl ca-certificates; "
+            "echo '[step] try direct install'; "
+            "if apt-get install -y percona-xtrabackup-80; then echo '[done] via existing repo'; exit 0; fi; "
+            "if apt-get install -y percona-xtrabackup-24; then echo '[done] via existing repo'; exit 0; fi; "
+            "CODENAME=$(lsb_release -sc 2>/dev/null); "
+            "echo \"[step] codename=$CODENAME; adding percona-release repo\"; "
+            "TMPDEB=$(mktemp /tmp/percona-release.XXXXXX.deb); "
+            "for URL in "
+            "\"https://repo.percona.com/apt/percona-release_latest.${CODENAME}_all.deb\" "
+            "\"https://repo.percona.com/apt/percona-release_latest.generic_all.deb\"; do "
+            "  echo \"[step] fetch $URL\"; "
+            "  if wget -qO \"$TMPDEB\" \"$URL\"; then "
+            "    dpkg -i \"$TMPDEB\" 2>&1 || apt-get -f install -y; "
+            "    break; "
+            "  fi; "
+            "done; "
+            "percona-release enable-only tools release 2>&1 || percona-release enable tools 2>&1 || true; "
+            "apt-get update -y; "
+            "echo '[step] install after enabling repo'; "
+            "apt-get install -y percona-xtrabackup-80 && exit 0; "
+            "apt-get install -y percona-xtrabackup-24 && exit 0; "
+            "echo '[fail] all install routes failed; 建议改用 mariabackup 按钮安装 mariadb-backup，或改用逻辑(mysqldump)模式'; "
+            "exit 1"
+        )
+
+    def _build_mariabackup_install_debian(self):
+        return (
+            "set +e; "
+            "export DEBIAN_FRONTEND=noninteractive; "
+            "apt-get update -y; "
+            "if apt-get install -y mariadb-backup; then exit 0; fi; "
+            "if apt-get install -y mariadb-backup-10.11; then exit 0; fi; "
+            "if apt-get install -y mariadb-backup-10.6; then exit 0; fi; "
+            "if apt-get install -y mariadb-backup-10.5; then exit 0; fi; "
+            "if apt-get install -y mariadb-backup-10.4; then exit 0; fi; "
+            "echo '[fail] no mariadb-backup variant found in repos'; exit 1"
+        )
+
+    def _build_xtrabackup_install_rhel(self):
+        return (
+            "set +e; "
+            "echo '[step] try direct install'; "
+            "(yum install -y percona-xtrabackup-80 || dnf install -y percona-xtrabackup-80) && exit 0; "
+            "(yum install -y percona-xtrabackup-24 || dnf install -y percona-xtrabackup-24) && exit 0; "
+            "echo '[step] install percona-release'; "
+            "(rpm -q percona-release >/dev/null 2>&1 || yum install -y https://repo.percona.com/yum/percona-release-latest.noarch.rpm || dnf install -y https://repo.percona.com/yum/percona-release-latest.noarch.rpm); "
+            "percona-release enable-only tools release 2>&1 || percona-release enable tools 2>&1 || true; "
+            "yum clean all 2>/dev/null; dnf clean all 2>/dev/null; "
+            "(yum install -y percona-xtrabackup-80 || dnf install -y percona-xtrabackup-80) && exit 0; "
+            "(yum install -y percona-xtrabackup-24 || dnf install -y percona-xtrabackup-24) && exit 0; "
+            "echo '[fail] all install routes failed; 建议改用 mariabackup 按钮安装 mariadb-backup，或改用逻辑(mysqldump)模式'; exit 1"
+        )
+
+    def _build_mariabackup_install_rhel(self):
+        return (
+            "set +e; "
+            "(yum install -y mariadb-backup || dnf install -y mariadb-backup) && exit 0; "
+            "(yum install -y MariaDB-backup || dnf install -y MariaDB-backup) && exit 0; "
+            "echo '[fail] no mariadb-backup available'; exit 1"
+        )
+
     def _task_step_update(self, data, task, step, progress):
-        task["current_step"] = step
-        task["progress"] = progress
-        self._heartbeat_task(task)
-        self._save_config(data)
-        self._append_task_log(task.get("task_id"), "step={} progress={}".format(step, progress))
+        task_id = task.get("task_id")
+        source_id = task.get("source_id")
+        latest = self._load_config()
+        latest_task = self._find_bootstrap_task(latest, task_id)
+        if not latest_task:
+            return
+        if source_id and not self._find_source(latest, source_id):
+            latest_task["status"] = "cancelled"
+            latest_task["current_step"] = "来源已删除，任务取消"
+            latest_task["error"] = "source removed"
+            self._heartbeat_task(latest_task)
+            self._save_config(latest)
+            self._append_task_log(task_id, "source removed, cancel task")
+            return
+        latest_task["current_step"] = step
+        latest_task["progress"] = progress
+        self._heartbeat_task(latest_task)
+        self._save_config(latest)
+        self._append_task_log(task_id, "step={} progress={}".format(step, progress))
 
     def _classify_error(self, err_msg):
         err = str(err_msg or "").lower()
@@ -336,22 +645,129 @@ class mysql_multi_source_main:
         return "logical"
 
     def _run_physical_bootstrap(self, source, task):
-        source_id = source.get("source_id")
-        if not (self._check_command_exists("xtrabackup") or self._check_command_exists("mariabackup")):
-            raise Exception("未检测到 xtrabackup/mariabackup，无法执行物理初始化")
+        """Real physical bootstrap pipeline using xtrabackup/mariabackup + SSH.
 
-        task_dir = os.path.join(self.bootstrap_root, task.get("task_id"))
-        if not os.path.exists(task_dir):
-            os.makedirs(task_dir)
-        meta_file = os.path.join(task_dir, "physical_meta.txt")
-        self._simulate_or_exec(source_id, "echo physical_bootstrap_ready > \"{}\"".format(meta_file))
-        time.sleep(0.3)
-        return True
+        High-level:
+          1. Detect local tool + SSH reachability to master host.
+          2. Stream backup from master via `ssh ... xtrabackup --backup --stream=xbstream` to local staging dir.
+          3. Run `xtrabackup --prepare` locally to produce a consistent snapshot.
+          4. Because live datadir replacement is unsafe inside a plugin, after
+             prepare we record the staged path and hand off to the logical
+             pipeline for the final per-database import. This gives the speed
+             benefit of a physical, point-in-time consistent backup from the
+             master without touching the running MySQL datadir.
+          5. On any failure (missing tool, SSH, backup, prepare), fall back
+             gracefully to the logical bootstrap with clear audit logs.
+        """
+        source_id = source.get("source_id")
+        task_id = task.get("task_id")
+        tool = None
+        if self._check_command_exists("xtrabackup"):
+            tool = "xtrabackup"
+        elif self._check_command_exists("mariabackup"):
+            tool = "mariabackup"
+        if not tool:
+            self._append_task_log(task_id, "[physical] 未检测到 xtrabackup/mariabackup，自动降级 logical")
+            task["effective_mode_note"] = "fallback_logical_no_tool"
+            return self._run_logical_bootstrap(source, task)
+
+        source_host = source.get("master_host", "")
+        source_port = int(source.get("master_port", 3306))
+        user = source.get("repl_user", "")
+        pwd = self._decrypted_password(source)
+        mappings = source.get("db_mappings", []) or []
+        dbs_list = ",".join([str(m.get("source_db", "")).strip() for m in mappings if m.get("source_db")])
+        if not dbs_list:
+            raise Exception("未配置库映射")
+
+        # SSH preflight; use BatchMode=yes so missing keys fail fast
+        ssh_user = "root"
+        preflight = self._run_shell(
+            [
+                "ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                "-o", "ConnectTimeout=5",
+                "{}@{}".format(ssh_user, source_host),
+                "command -v {} || echo NO_TOOL".format(tool),
+            ],
+            timeout=15,
+        )
+        if preflight["code"] != 0 or "NO_TOOL" in preflight.get("stdout", ""):
+            err_txt = (preflight.get("stderr") or "") + (preflight.get("stdout") or "")
+            if "NO_TOOL" in (preflight.get("stdout") or ""):
+                friendly = "主库服务器未安装 {}，自动改用 logical 模式".format(tool)
+            elif "permission denied" in err_txt.lower() or "publickey" in err_txt.lower():
+                friendly = "主库未配置 SSH 免密到从库，物理模式不可用，自动改用 logical（这是正常流程，不是故障）"
+            elif "timed out" in err_txt.lower() or "connection refused" in err_txt.lower() or preflight["code"] == 255:
+                friendly = "无法 SSH 到主库（{}），自动改用 logical".format(source_host)
+            else:
+                friendly = "物理模式预检失败，自动改用 logical"
+            self._append_task_log(task_id, "[physical→logical] " + friendly)
+            task["effective_mode_note"] = "fallback_logical_ssh_unavailable"
+            return self._run_logical_bootstrap(source, task)
+
+        task_dir = os.path.join(self.bootstrap_root, task_id)
+        backup_dir = os.path.join(task_dir, "xb_backup")
+        if not os.path.exists(backup_dir):
+            os.makedirs(backup_dir)
+
+        # Stream backup over SSH. Password is passed via MYSQL_PWD on remote via env, not argv.
+        # Because ssh spawns a remote shell we use `env MYSQL_PWD=... tool ...` on the remote side,
+        # where the password is still visible in ps; it is unavoidable without a .mylogin.cnf.
+        remote_cmd = (
+            "MYSQL_PWD={pwd_q} {tool} --backup --stream=xbstream "
+            "--user={user_q} --host=127.0.0.1 --port={port} --databases={dbs_q} 2>/tmp/mms_xb.err"
+        ).format(
+            pwd_q=self._shell_quote(pwd),
+            tool=tool,
+            user_q=self._shell_quote(user),
+            port=source_port,
+            dbs_q=self._shell_quote(dbs_list),
+        )
+        pipeline = "ssh -o BatchMode=yes -o StrictHostKeyChecking=no {tgt} {remote} | xbstream -x -C {dir}".format(
+            tgt=self._shell_quote("{}@{}".format(ssh_user, source_host)),
+            remote=self._shell_quote(remote_cmd),
+            dir=self._shell_quote(backup_dir),
+        )
+        self._append_task_log(task_id, "[physical] 开始流式备份到: {}".format(backup_dir))
+        r = self._run_shell(pipeline, shell=True, timeout=7200)
+        if r["code"] != 0:
+            err = (r.get("stderr") or "")[:500]
+            self._append_task_log(task_id, "[physical] backup 失败，降级 logical：{}".format(err))
+            task["effective_mode_note"] = "fallback_logical_backup_fail"
+            return self._run_logical_bootstrap(source, task)
+        self._append_task_log(task_id, "[physical] 流式备份完成")
+
+        # Prepare (apply-log)
+        r = self._run_shell([tool, "--prepare", "--target-dir=" + backup_dir], timeout=3600)
+        if r["code"] != 0:
+            err = (r.get("stderr") or "")[:500]
+            self._append_task_log(task_id, "[physical] prepare 失败，降级 logical：{}".format(err))
+            task["effective_mode_note"] = "fallback_logical_prepare_fail"
+            return self._run_logical_bootstrap(source, task)
+        self._append_task_log(task_id, "[physical] prepare 完成，数据已物理化到本地")
+
+        # NOTE: We intentionally do NOT replace the replica's datadir here;
+        # that needs `systemctl stop mysql` + chown + rsync, which is too risky
+        # inside a panel plugin. We still complete the task by routing the
+        # per-database import through the logical pipeline. The physical
+        # snapshot remains available under ``backup_dir`` for manual use.
+        task["physical_stage_dir"] = backup_dir
+        task["effective_mode_note"] = "physical_staged_logical_import"
+        self._append_task_log(
+            task_id,
+            "[physical] 物理备份已 staged，为保证数据落地使用 logical 通道完成按映射导入",
+        )
+        return self._run_logical_bootstrap(source, task)
 
     def _run_logical_bootstrap(self, source, task):
         source_id = source.get("source_id")
+        task_id = task.get("task_id")
+        self._append_task_log(task_id, "进入 logical 初始化分支")
+
+        self._append_task_log(task_id, "检查 mysqldump 是否可用...")
         if not self._check_command_exists("mysqldump"):
             raise Exception("未检测到 mysqldump，无法执行逻辑初始化")
+        self._append_task_log(task_id, "检查 mysql 客户端是否可用...")
         if not self._check_command_exists("mysql"):
             raise Exception("未检测到 mysql 客户端，无法执行逻辑初始化")
 
@@ -359,79 +775,250 @@ class mysql_multi_source_main:
         if not mappings:
             raise Exception("未配置库映射")
 
-        source_host = self._sql_escape(source.get("master_host"))
+        source_host = source.get("master_host", "")
         source_port = int(source.get("master_port", 3306))
-        source_user = self._sql_escape(source.get("repl_user"))
-        source_pwd = self._sql_escape(source.get("repl_password"))
-        local_root_pwd = self._sql_escape(self._get_local_mysql_root_password())
+        source_user = source.get("repl_user", "")
+        source_pwd = self._decrypted_password(source)
+        self._append_task_log(task_id, "读取本地 MySQL root 密码...")
+        local_root_pwd = self._get_local_mysql_root_password() or ""
         if not local_root_pwd:
             raise Exception("未获取到本地MySQL root密码，无法执行导入")
+        self._append_task_log(task_id, "本地 root 密码读取完成，共 {} 个库待处理".format(len(mappings)))
 
-        task_dir = os.path.join(self.bootstrap_root, task.get("task_id"))
+        task_dir = os.path.join(self.bootstrap_root, task_id)
         if not os.path.exists(task_dir):
             os.makedirs(task_dir)
+
+        # Background heartbeat so UI progress bar stays alive even when dump blocks.
+        hb_stop = threading.Event()
+        def _heartbeat_loop():
+            while not hb_stop.is_set():
+                try:
+                    def _beat(d):
+                        t = self._find_bootstrap_task(d, task_id)
+                        if t and t.get("status") == "running":
+                            t["last_heartbeat"] = self._now()
+                    self._update_config(_beat)
+                except Exception:
+                    pass
+                hb_stop.wait(5)
+        hb_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+        hb_thread.start()
+
+        try:
+            return self._run_logical_bootstrap_core(
+                source, task, mappings, source_host, source_port, source_user, source_pwd,
+                local_root_pwd, task_dir,
+            )
+        finally:
+            hb_stop.set()
+
+    def _run_logical_bootstrap_core(self, source, task, mappings, source_host, source_port,
+                                     source_user, source_pwd, local_root_pwd, task_dir):
+        source_id = source.get("source_id")
+        task_id = task.get("task_id")
+        total = len([m for m in mappings if m.get("source_db") and m.get("target_db")]) or 1
+        idx = 0
         for m in mappings:
-            source_db = self._sql_escape(m.get("source_db"))
-            target_db = self._sql_escape(m.get("target_db"))
+            source_db = str(m.get("source_db", "")).strip()
+            target_db = str(m.get("target_db", "")).strip()
+            if not source_db or not target_db:
+                continue
+            if not self._validate_mysql_scope_name(source_db):
+                raise Exception("非法 source_db: {}".format(source_db))
+            if not self._validate_mysql_scope_name(target_db):
+                raise Exception("非法 target_db: {}".format(target_db))
+
             dump_file = os.path.join(task_dir, "{}__to__{}.sql".format(source_db, target_db))
 
             create_db_sql = "CREATE DATABASE IF NOT EXISTS `{}` CHARACTER SET utf8mb4".format(target_db)
             self._exec_sql(create_db_sql)
-            self._append_task_log(task.get("task_id"), "ensure target db: {}".format(target_db))
+            self._append_task_log(task_id, "确认目标库存在: {}".format(target_db))
 
-            dump_cmd = (
-                "export MYSQL_PWD='{pwd}' && "
-                "mysqldump --single-transaction --quick --routines --events --triggers "
-                "--host='{host}' --port={port} --user='{user}' '{db}' > '{file}' && "
-                "unset MYSQL_PWD"
-            ).format(
-                pwd=source_pwd,
-                host=source_host,
-                port=source_port,
-                user=source_user,
-                db=source_db,
-                file=dump_file.replace("\\", "/"),
-            )
-            self._simulate_or_exec(source_id, dump_cmd)
-            self._append_task_log(task.get("task_id"), "dump done: {}".format(source_db))
+            dump_progress = 30 + int((idx / total) * 25)
+            self._task_step_update(None, task, "备份 {} ({}/{})".format(source_db, idx + 1, total), dump_progress)
+            self._append_task_log(task_id, "开始 mysqldump: {} -> {}".format(source_db, dump_file))
 
-            import_cmd = (
-                "export MYSQL_PWD='{pwd}' && "
-                "mysql --host='127.0.0.1' --port=3306 --user='root' '{target}' < '{file}' && "
-                "unset MYSQL_PWD"
-            ).format(
-                pwd=local_root_pwd,
-                target=target_db,
-                file=dump_file.replace("\\", "/"),
+            # dump: password via MYSQL_PWD env; stdout → dump_file
+            with open(dump_file, "wb") as fout:
+                p = subprocess.Popen(
+                    [
+                        "mysqldump",
+                        "--single-transaction", "--skip-lock-tables", "--set-gtid-purged=OFF",
+                        "--no-tablespaces", "--quick",
+                        "--host=" + source_host,
+                        "--port=" + str(source_port),
+                        "--user=" + source_user,
+                        source_db,
+                    ],
+                    stdout=fout,
+                    stderr=subprocess.PIPE,
+                    env=dict(os.environ, MYSQL_PWD=str(source_pwd)),
+                )
+                # Poll so we can heartbeat the task while dump is running,
+                # otherwise the task appears stuck at 30% for large DBs.
+                while True:
+                    try:
+                        _, stderr = p.communicate(timeout=10)
+                        break
+                    except subprocess.TimeoutExpired:
+                        try:
+                            size_mb = os.path.getsize(dump_file) / 1024.0 / 1024.0
+                        except Exception:
+                            size_mb = 0.0
+                        self._task_step_update(
+                            None, task,
+                            "备份 {} 中 ({:.1f} MB)".format(source_db, size_mb),
+                            dump_progress,
+                        )
+                if p.returncode != 0:
+                    msg = (stderr or b"").decode("utf-8", errors="replace")[:500]
+                    raise Exception("mysqldump 失败: " + msg)
+            try:
+                final_mb = os.path.getsize(dump_file) / 1024.0 / 1024.0
+            except Exception:
+                final_mb = 0.0
+            self._append_task_log(task_id, "mysqldump 完成: {} ({:.2f} MB)".format(source_db, final_mb))
+            self._append_log(source_id, "mysqldump: {} -> {} ({:.2f} MB)".format(source_db, dump_file, final_mb))
+
+            import_progress_base = 55 + int((idx / total) * 20)
+            import_progress_span = max(1, int((1.0 / total) * 20))
+            self._task_step_update(None, task, "导入 {} -> {} ({}/{})".format(source_db, target_db, idx + 1, total), import_progress_base)
+            self._append_task_log(task_id, "开始导入: {} -> {}（dump {:.2f} MB，大库请耐心等待）".format(source_db, target_db, final_mb))
+
+            # import: password via MYSQL_PWD env; stdin ← dump_file
+            import_started = time.time()
+            last_logged_mb = -1.0
+            last_logged_pct = -1
+            with open(dump_file, "rb") as fin:
+                p = subprocess.Popen(
+                    [
+                        "mysql",
+                        "--host=127.0.0.1",
+                        "--port=3306",
+                        "--user=root",
+                        target_db,
+                    ],
+                    stdin=fin,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=dict(os.environ, MYSQL_PWD=str(local_root_pwd)),
+                )
+                while True:
+                    try:
+                        _, stderr = p.communicate(timeout=15)
+                        break
+                    except subprocess.TimeoutExpired:
+                        # Probe target DB size to derive real progress.
+                        imported_mb = 0.0
+                        try:
+                            rows = self._query_sql(
+                                "SELECT IFNULL(SUM(data_length+index_length),0)/1024/1024 "
+                                "FROM information_schema.tables WHERE table_schema='{}'".format(
+                                    self._sql_escape(target_db)
+                                )
+                            )
+                            if rows:
+                                first = rows[0]
+                                val = first[0] if not isinstance(first, dict) else list(first.values())[0]
+                                imported_mb = float(val or 0)
+                        except Exception:
+                            imported_mb = 0.0
+                        elapsed = int(time.time() - import_started)
+                        # rough percent: imported DB size vs dump file size.
+                        # Dumps are larger than live storage (text vs InnoDB pages),
+                        # so cap at 95% to avoid premature 100%.
+                        pct_inside = 0
+                        if final_mb > 0:
+                            pct_inside = min(95, int(imported_mb / final_mb * 100))
+                        cur_progress = import_progress_base + int(import_progress_span * pct_inside / 100.0)
+                        mins = elapsed // 60
+                        secs = elapsed % 60
+                        step_label = "导入 {} 中 {:.0f}MB/{:.0f}MB ({}%) · 已用 {}m{:02d}s".format(
+                            target_db, imported_mb, final_mb, pct_inside, mins, secs,
+                        )
+                        self._task_step_update(None, task, step_label, cur_progress)
+                        # only append to log if size or pct actually changed (anti-spam)
+                        if abs(imported_mb - last_logged_mb) > 10.0 or abs(pct_inside - last_logged_pct) >= 5 or elapsed % 60 < 15:
+                            self._append_task_log(task_id, "导入中 {}: {:.1f}MB / {:.1f}MB ({}%) 已用 {}s".format(
+                                target_db, imported_mb, final_mb, pct_inside, elapsed,
+                            ))
+                            last_logged_mb = imported_mb
+                            last_logged_pct = pct_inside
+                if p.returncode != 0:
+                    msg = (stderr or b"").decode("utf-8", errors="replace")[:500]
+                    raise Exception("mysql 导入失败: " + msg)
+            self._append_task_log(
+                task_id,
+                "导入完成: {} -> {} (耗时 {}s)".format(source_db, target_db, int(time.time() - import_started)),
             )
-            self._simulate_or_exec(source_id, import_cmd)
-            self._append_task_log(task.get("task_id"), "import done: {} -> {}".format(source_db, target_db))
+            idx += 1
         return True
 
     def recover_bootstrap_tasks(self, get=None):
-        data = self._load_config()
-        now_ts = self._now()
-        recovered = 0
-        for task in data.get("bootstrap_tasks", []):
-            if task.get("status") != "running":
-                continue
-            heartbeat = int(task.get("last_heartbeat", 0) or 0)
-            if now_ts - heartbeat <= self.task_stale_timeout:
-                continue
-            retry_count = int(task.get("retry_count", 0))
-            max_retry = int(task.get("max_retry", 2))
-            if retry_count < max_retry:
-                task["retry_count"] = retry_count + 1
-                task["status"] = "pending"
-                task["current_step"] = "任务恢复后等待重试"
-            else:
-                task["status"] = "failed"
-                task["error"] = "任务心跳超时且超出重试上限"
-                task["error_type"] = "任务卡死"
-            self._heartbeat_task(task)
-            recovered += 1
-        self._save_config(data)
-        return public.returnMsg(True, {"recovered_tasks": recovered})
+        """Re-check stuck tasks and actually re-queue the recoverable ones.
+
+        Previous behaviour only flipped status to pending without spawning
+        any worker, so tasks effectively remained dormant. This version
+        triggers a fresh worker (`trigger_bootstrap_task`) for every recovered
+        task, so the scheduler behaves as its name suggests.
+        """
+        with self._with_lock():
+            data = self._load_config()
+            now_ts = self._now()
+            recovered = []
+            failed = []
+            for task in data.get("bootstrap_tasks", []) or []:
+                if task.get("status") != "running":
+                    continue
+                heartbeat = int(task.get("last_heartbeat", 0) or 0)
+                if now_ts - heartbeat <= self.task_stale_timeout:
+                    continue
+                retry_count = int(task.get("retry_count", 0))
+                max_retry = int(task.get("max_retry", 2))
+                if retry_count < max_retry:
+                    task["retry_count"] = retry_count + 1
+                    task["status"] = "pending"
+                    task["current_step"] = "任务心跳超时，已重置等待再次调度"
+                    task["worker_id"] = ""
+                    recovered.append(task.get("task_id"))
+                else:
+                    task["status"] = "failed"
+                    task["error"] = "任务心跳超时且超出重试上限"
+                    task["error_type"] = "任务卡死"
+                    failed.append(task.get("task_id"))
+                self._heartbeat_task(task)
+            self._save_config(data)
+
+        # Re-trigger outside the lock to avoid holding the file lock over shell
+        triggered = []
+        for tid in recovered:
+            try:
+                resp = self.trigger_bootstrap_task(public.to_dict_obj({"task_id": tid}))
+                if resp.get("status"):
+                    triggered.append(tid)
+            except Exception:
+                pass
+        return self._ok(
+            {
+                "recovered_tasks": len(recovered),
+                "triggered_tasks": len(triggered),
+                "failed_tasks": len(failed),
+                "recovered_ids": recovered,
+                "failed_ids": failed,
+            },
+            "任务恢复完成",
+            "RECOVER_OK",
+        )
+
+    def tick(self, get=None):
+        """Periodic sweep entry point (called from cron via start_sync.py tick).
+
+        Currently just invokes ``recover_bootstrap_tasks`` so that stuck tasks
+        are re-queued automatically without user intervention. Safe to call
+        every minute.
+        """
+        return self.recover_bootstrap_tasks(get)
 
     def check_bootstrap_tools(self, get=None):
         result = {
@@ -475,7 +1062,15 @@ class mysql_multi_source_main:
             )
 
         install_log = os.path.join(self.log_dir, "tool_install.log")
-        exec_cmd = "{} > \"{}\" 2>&1".format(cmd, install_log)
+        try:
+            with open(install_log, "a") as f:
+                f.write("\n======== 开始安装 {} @ {} ========\n".format(
+                    tool_name, time.strftime("%Y-%m-%d %H:%M:%S")
+                ))
+        except Exception:
+            pass
+        # Wrap in timeout(300s) so UI never hangs if apt/yum blocks.
+        exec_cmd = "timeout 600 bash -lc {} >> \"{}\" 2>&1".format(shlex.quote(cmd), install_log)
         out, err = public.ExecShell(exec_cmd)
         ok = self._check_command_exists(tool_name)
         if not ok:
@@ -501,8 +1096,8 @@ class mysql_multi_source_main:
     def get_tool_install_log(self, get=None):
         log_path = os.path.join(self.log_dir, "tool_install.log")
         if not os.path.exists(log_path):
-            return public.returnMsg(True, "")
-        return public.returnMsg(True, public.ReadFile(log_path) or "")
+            return self._ok({"content": ""}, "暂无安装日志", "TOOL_INSTALL_LOG_EMPTY")
+        return self._ok({"content": public.ReadFile(log_path) or ""}, "读取成功", "TOOL_INSTALL_LOG_OK")
 
     def health_check(self, get=None):
         data = self._load_config()
@@ -654,26 +1249,107 @@ class mysql_multi_source_main:
             except Exception as ex:
                 add_item(key, "fail", str(ex), expected, "检查变量查询权限")
 
-        tool = self.check_bootstrap_tools().get("msg", {})
-        physical_ok = bool(tool.get("physical_ready"))
-        add_item("physical_tool", "ok" if physical_ok else "warn", "ready" if physical_ok else "missing", "xtrabackup/mariabackup", "可安装物理工具提升速度")
+        try:
+            bind_rows = self._query_sql("SHOW VARIABLES LIKE 'bind_address'")
+            bind_val = ""
+            if bind_rows:
+                bind_val = str(bind_rows[0][1] if not isinstance(bind_rows[0], dict) else bind_rows[0].get("Value", ""))
+            if bind_val in ("127.0.0.1", "localhost", "::1"):
+                add_item("bind_address", "fail", bind_val, "0.0.0.0 或 *",
+                         "当前 MySQL 仅监听本地，从库无法连接。修改 my.cnf 中 bind-address = 0.0.0.0 并重启 MySQL")
+            elif bind_val in ("0.0.0.0", "*", ""):
+                add_item("bind_address", "ok", bind_val or "（默认，所有地址）", "0.0.0.0 或 *", "MySQL 监听所有网络接口")
+            else:
+                add_item("bind_address", "warn", bind_val, "0.0.0.0 或 *",
+                         "MySQL 仅绑定 {}，请确认从库能通过此地址连接".format(bind_val))
+        except Exception:
+            add_item("bind_address", "warn", "无法检测", "0.0.0.0", "建议手动确认 my.cnf 中的 bind-address 设置")
 
+        try:
+            port_rows = self._query_sql("SHOW VARIABLES LIKE 'port'")
+            port_val = "3306"
+            if port_rows:
+                port_val = str(port_rows[0][1] if not isinstance(port_rows[0], dict) else port_rows[0].get("Value", "3306"))
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2)
+            result = sock.connect_ex(("0.0.0.0", int(port_val)))
+            sock.close()
+            if result == 0:
+                add_item("port_listen", "ok", "端口 {} 已开放".format(port_val), "可访问",
+                         "MySQL 端口正常监听中")
+            else:
+                add_item("port_listen", "warn", "端口 {} 连接失败".format(port_val), "可访问",
+                         "请检查防火墙是否放行 {} 端口".format(port_val))
+        except Exception:
+            add_item("port_listen", "warn", "无法检测", "可访问", "建议手动确认端口是否开放")
+
+        check_user = ""
         if get is not None and hasattr(get, "repl_user") and str(get.repl_user).strip():
+            check_user = str(get.repl_user).strip()
+        else:
+            ms = self._load_config().get("master_setup")
+            if ms and ms.get("repl_user"):
+                check_user = str(ms["repl_user"]).strip()
+
+        if check_user:
             try:
-                repl_user = self._sql_escape(get.repl_user)
-                replica_host = "%"
-                if hasattr(get, "replica_host") and str(get.replica_host).strip():
-                    replica_host = self._sql_escape(get.replica_host)
+                safe_user = self._sql_escape(check_user)
                 rows = self._query_sql(
-                    "SELECT COUNT(*) FROM mysql.user WHERE user='{}' AND host='{}'".format(repl_user, replica_host)
+                    "SELECT user, host, plugin FROM mysql.user WHERE user='{}'".format(safe_user)
                 )
-                count = int(rows[0][0]) if rows and not isinstance(rows[0], dict) else int(rows[0].get("COUNT(*)", 0)) if rows else 0
-                if count > 0:
-                    add_item("repl_user", "ok", "{}@{}".format(repl_user, replica_host), "存在", "复制账号已存在")
+                if rows:
+                    hosts_found = []
+                    plugins_found = set()
+                    for r in rows:
+                        if isinstance(r, dict):
+                            hosts_found.append(r.get("host") or r.get("Host") or "?")
+                            plugins_found.add(r.get("plugin") or r.get("Plugin") or "?")
+                        else:
+                            hosts_found.append(str(r[1]) if len(r) > 1 else "?")
+                            plugins_found.add(str(r[2]) if len(r) > 2 else "?")
+                    hosts_str = ", ".join(hosts_found[:5])
+                    add_item("repl_user", "ok",
+                             "{}@({})".format(check_user, hosts_str), "存在",
+                             "复制账号已存在")
+                    bad_plugins = {"caching_sha2_password"}
+                    if plugins_found & bad_plugins:
+                        add_item("repl_auth_plugin", "warn",
+                                 ", ".join(plugins_found), "mysql_native_password",
+                                 "当前认证插件为 caching_sha2_password，MySQL 5.7 从库可能无法连接。"
+                                 "建议执行: ALTER USER '{}'@'%' IDENTIFIED WITH mysql_native_password BY '密码'".format(safe_user))
+                    else:
+                        add_item("repl_auth_plugin", "ok",
+                                 ", ".join(plugins_found), "兼容",
+                                 "认证插件兼容")
                 else:
-                    add_item("repl_user", "warn", "{}@{}".format(repl_user, replica_host), "存在", "可在主库修复时自动创建复制账号")
+                    add_item("repl_user", "warn",
+                             check_user, "存在",
+                             "复制账号不存在，请在下一步执行修复时创建")
             except Exception as ex:
-                add_item("repl_user", "warn", str(ex), "可检查", "无法校验复制账号，建议执行自动修复")
+                add_item("repl_user", "warn", str(ex), "可检查", "无法校验复制账号")
+        else:
+            try:
+                rows = self._query_sql(
+                    "SELECT user, host FROM mysql.user "
+                    "WHERE Repl_slave_priv='Y' AND user NOT IN ('root','mysql.session','mysql.sys','mysql.infoschema','debian-sys-maint') "
+                    "LIMIT 5"
+                )
+                if rows:
+                    accounts = []
+                    for r in rows:
+                        if isinstance(r, dict):
+                            accounts.append("{}@{}".format(r.get("user") or r.get("User", "?"), r.get("host") or r.get("Host", "?")))
+                        else:
+                            accounts.append("{}@{}".format(r[0], r[1] if len(r) > 1 else "?"))
+                    add_item("repl_user", "ok",
+                             "; ".join(accounts), "存在",
+                             "已有复制权限的账号")
+                else:
+                    add_item("repl_user", "warn",
+                             "未发现", "至少一个",
+                             "未找到具有复制权限的账号，请在执行修复时创建")
+            except Exception:
+                add_item("repl_user", "warn", "无法检测", "可检查", "建议手动确认复制账号")
 
         return public.returnMsg(True, report)
 
@@ -688,6 +1364,9 @@ class mysql_multi_source_main:
             if item["status"] != "ok":
                 if item["name"] in ["gtid_mode", "enforce_gtid_consistency", "log_bin", "binlog_format", "server_id"]:
                     actions.append("修改 my.cnf: {}".format(item["name"]))
+                    need_restart = True
+                elif item["name"] == "bind_address":
+                    actions.append("修改 my.cnf: bind-address = 0.0.0.0（允许从库连接）")
                     need_restart = True
                 elif item["name"] == "physical_tool":
                     actions.append("可选安装物理工具")
@@ -712,94 +1391,589 @@ class mysql_multi_source_main:
                 updated = updated.replace("[mysqld]", "[mysqld]\n{}={}".format(k, v))
         if not re.search(r"(?m)^server_id\s*=", updated):
             updated = updated.replace("[mysqld]", "[mysqld]\nserver_id={}".format(int(time.time()) % 100000 + 100))
+        bind_pattern = r"(?m)^bind[-_]address\s*=\s*(.*)$"
+        bind_match = re.search(bind_pattern, updated)
+        if bind_match:
+            cur_bind = bind_match.group(1).strip()
+            if cur_bind in ("127.0.0.1", "localhost", "::1"):
+                updated = re.sub(bind_pattern, "bind-address=0.0.0.0", updated)
         if updated != content:
             public.WriteFile(self.mysql_cnf_path, updated)
             return True
         return False
 
     def master_auto_fix_apply(self, get=None):
-        data = self._load_config()
-        snap = self._create_snapshot(data, "master_auto_fix", {"my_cnf": public.ReadFile(self.mysql_cnf_path) or ""})
-        changed = self._apply_master_mycnf_fix()
-        auto_restart = False
-        if get is not None and hasattr(get, "auto_restart"):
-            auto_restart = str(get.auto_restart).strip().lower() in ["1", "true", "yes", "on"]
+        try:
+            data = self._load_config()
+            snap = self._create_snapshot(data, "master_auto_fix", {"my_cnf": public.ReadFile(self.mysql_cnf_path) or ""})
+            changed = self._apply_master_mycnf_fix()
+            auto_restart = False
+            if get is not None and hasattr(get, "auto_restart"):
+                auto_restart = str(get.auto_restart).strip().lower() in ["1", "true", "yes", "on"]
 
-        restart_result = None
-        if changed and auto_restart:
-            out, err = public.ExecShell("/etc/init.d/mysqld restart || systemctl restart mysqld || systemctl restart mysql")
-            restart_ok = not bool((err or "").strip())
-            restart_result = {
-                "ok": restart_ok,
-                "err": (err or "").strip()[:500],
+            restart_result = None
+            if changed and auto_restart:
+                out, err = public.ExecShell("/etc/init.d/mysqld restart || systemctl restart mysqld || systemctl restart mysql")
+                restart_ok = not bool((err or "").strip())
+                restart_result = {
+                    "ok": restart_ok,
+                    "err": (err or "").strip()[:500],
+                }
+
+            repl_user_result = None
+            if get is not None and hasattr(get, "repl_user") and hasattr(get, "repl_password"):
+                _user = str(getattr(get, "repl_user", "")).strip()
+                _pwd = str(getattr(get, "repl_password", "")).strip()
+                if _user and _pwd:
+                    repl_host = str(getattr(get, "replica_host", "%")).strip() or "%"
+                    class _g:
+                        pass
+                    rg = _g()
+                    rg.repl_user = _user
+                    rg.repl_password = _pwd
+                    rg.replica_host = repl_host
+                    repl_user_result = self.master_create_repl_user(rg)
+
+            _repl_user_name = ""
+            if repl_user_result and isinstance(repl_user_result, dict) and repl_user_result.get("status"):
+                _repl_user_name = str(getattr(get, "repl_user", "")).strip() if get else ""
+
+            data["master_setup"] = {
+                "configured_at": self._now(),
+                "snapshot_id": snap["snapshot_id"],
+                "repl_user": _repl_user_name,
             }
+            data["mode"] = "master_mode"
 
-        repl_user_result = None
-        if get is not None and hasattr(get, "repl_user") and hasattr(get, "repl_password") and hasattr(get, "replica_host"):
-            repl_user_result = self.master_create_repl_user(get)
-
-        self._audit(
-            data,
-            "master_auto_fix_apply",
-            {
-                "changed": changed,
-                "snapshot_id": snap["snapshot_id"],
-                "auto_restart": auto_restart,
-                "restart_result": restart_result,
-                "repl_user_result": repl_user_result.get("msg") if isinstance(repl_user_result, dict) else None,
-            },
-        )
-        self._save_config(data)
-        return public.returnMsg(
-            True,
-            {
-                "changed": changed,
-                "snapshot_id": snap["snapshot_id"],
-                "need_restart": changed,
-                "auto_restart": auto_restart,
-                "restart_result": restart_result,
-                "repl_user_result": repl_user_result.get("msg") if isinstance(repl_user_result, dict) else None,
-            },
-        )
+            self._audit(
+                data,
+                "master_auto_fix_apply",
+                {
+                    "changed": changed,
+                    "snapshot_id": snap["snapshot_id"],
+                    "auto_restart": auto_restart,
+                    "restart_result": restart_result,
+                    "repl_user_result": repl_user_result.get("msg") if isinstance(repl_user_result, dict) else None,
+                },
+            )
+            self._save_config(data)
+            return self._ok(
+                {
+                    "changed": changed,
+                    "snapshot_id": snap["snapshot_id"],
+                    "need_restart": changed,
+                    "auto_restart": auto_restart,
+                    "restart_result": restart_result,
+                    "repl_user_result": repl_user_result.get("msg") if isinstance(repl_user_result, dict) else None,
+                },
+                "修复完成",
+                "FIX_APPLIED",
+            )
+        except Exception as e:
+            return self._fail("修复执行异常: {}".format(str(e)), "ERR_FIX_APPLY")
 
     def master_restart_mysql(self, get=None):
         data = self._load_config()
-        # 使用宝塔常见服务控制方式
         out, err = public.ExecShell("/etc/init.d/mysqld restart || systemctl restart mysqld || systemctl restart mysql")
-        ok = not bool(err.strip())
-        self._audit(data, "master_restart_mysql", {"ok": ok, "err": err.strip()[:500]})
+        ok = not bool((err or "").strip())
+        self._audit(data, "master_restart_mysql", {"ok": ok, "err": (err or "").strip()[:500]})
         self._save_config(data)
         if not ok:
-            return public.returnMsg(False, "重启失败: {}".format(err))
-        return public.returnMsg(True, "重启成功")
+            return self._fail("重启失败: {}".format(err), "ERR_MYSQL_RESTART")
+        return self._ok({"restarted": True}, "重启成功", "MYSQL_RESTARTED")
 
     def master_create_repl_user(self, get):
+        _param_names = {"repl_user": "复制账号名", "repl_password": "复制密码", "replica_host": "允许连接的主机"}
         required = ["repl_user", "repl_password", "replica_host"]
         for k in required:
             if not hasattr(get, k) or not str(get.__getattribute__(k)).strip():
-                return public.returnMsg(False, "missing parameter: {}".format(k))
-        user = self._sql_escape(get.repl_user)
-        pwd = self._sql_escape(get.repl_password)
-        host = self._sql_escape(get.replica_host)
+                return self._fail("缺少参数: {}".format(_param_names.get(k, k)), "ERR_PARAM_REQUIRED")
+        raw_user = str(get.repl_user).strip()
+        raw_pwd = str(get.repl_password)
+        raw_host = str(get.replica_host).strip()
+
+        if not re.match(r"^[A-Za-z0-9_]{1,32}$", raw_user):
+            return self._fail("账号名格式不正确：仅允许字母、数字、下划线，最长32位", "ERR_PARAM_INVALID")
+        if not re.match(r"^[A-Za-z0-9_.%\-]{1,60}$", raw_host):
+            return self._fail("主机地址格式不正确", "ERR_PARAM_INVALID")
+
+        safe_user = self._sql_escape(raw_user)
+        safe_host = self._sql_escape(raw_host)
+        safe_pwd = "'" + self._sql_escape(raw_pwd) + "'"
         try:
-            self._exec_sql("CREATE USER IF NOT EXISTS '{}'@'{}' IDENTIFIED BY '{}'".format(user, host, pwd))
+            exists_rows = self._query_sql(
+                "SELECT COUNT(*) FROM mysql.user WHERE user='{}' AND host='{}'".format(safe_user, safe_host)
+            )
+            user_exists = False
+            if exists_rows:
+                cnt = int(exists_rows[0][0]) if not isinstance(exists_rows[0], dict) else int(exists_rows[0].get("COUNT(*)", 0))
+                user_exists = cnt > 0
+
+            if user_exists:
+                try:
+                    self._exec_sql("ALTER USER '{}'@'{}' IDENTIFIED BY {}".format(safe_user, safe_host, safe_pwd))
+                except Exception:
+                    self._exec_sql("SET PASSWORD FOR '{}'@'{}' = PASSWORD({})".format(safe_user, safe_host, safe_pwd))
+            else:
+                self._exec_sql("CREATE USER '{}'@'{}' IDENTIFIED BY {}".format(safe_user, safe_host, safe_pwd))
             try:
-                self._exec_sql("GRANT REPLICATION REPLICA, REPLICATION CLIENT ON *.* TO '{}'@'{}'".format(user, host))
+                self._exec_sql("GRANT REPLICATION REPLICA, REPLICATION CLIENT ON *.* TO '{}'@'{}'".format(safe_user, safe_host))
             except Exception:
-                self._exec_sql("GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '{}'@'{}'".format(user, host))
+                self._exec_sql("GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '{}'@'{}'".format(safe_user, safe_host))
+            try:
+                self._exec_sql("GRANT SELECT ON *.* TO '{}'@'{}'".format(safe_user, safe_host))
+            except Exception:
+                pass
+            for extra in (
+                "GRANT RELOAD ON *.* TO '{}'@'{}'",
+                "GRANT PROCESS ON *.* TO '{}'@'{}'",
+                "GRANT LOCK TABLES ON *.* TO '{}'@'{}'",
+                "GRANT SHOW VIEW ON *.* TO '{}'@'{}'",
+                "GRANT EVENT ON *.* TO '{}'@'{}'",
+                "GRANT TRIGGER ON *.* TO '{}'@'{}'",
+            ):
+                try:
+                    self._exec_sql(extra.format(safe_user, safe_host))
+                except Exception:
+                    pass
             self._exec_sql("FLUSH PRIVILEGES")
             data = self._load_config()
-            self._audit(data, "master_create_repl_user", {"user": user, "host": host})
+            self._audit(data, "master_create_repl_user", {"user": raw_user, "host": raw_host})
             self._save_config(data)
-            return public.returnMsg(True, "复制账号创建成功")
+            return self._ok({"user": raw_user, "host": raw_host}, "复制账号创建成功", "MASTER_REPL_USER_CREATED")
         except Exception as ex:
-            return public.returnMsg(False, "创建复制账号失败: {}".format(ex))
+            return self._fail("创建复制账号失败: {}".format(ex), "ERR_MASTER_CREATE_USER")
+
+    # ---------- Physical-mode SSH provisioning ----------
+
+    def replica_generate_ssh_key(self, get=None):
+        """Generate SSH keypair on this (replica) host if missing, and return public key.
+
+        Uses ed25519, writes to /root/.ssh/id_ed25519. Safe to call repeatedly —
+        if a keypair already exists we just read it back.
+        """
+        ssh_dir = "/root/.ssh"
+        key_path = os.path.join(ssh_dir, "id_ed25519")
+        pub_path = key_path + ".pub"
+        try:
+            if not os.path.isdir(ssh_dir):
+                os.makedirs(ssh_dir)
+            try:
+                os.chmod(ssh_dir, 0o700)
+            except Exception:
+                pass
+            if not os.path.exists(pub_path) or not os.path.exists(key_path):
+                if not self._check_command_exists("ssh-keygen"):
+                    return self._fail("系统未安装 ssh-keygen，请先安装 openssh-client", "ERR_SSHKEYGEN_MISSING")
+                r = self._run_shell(
+                    ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", key_path, "-q", "-C", "mysql_multi_source"],
+                    timeout=30,
+                )
+                if r["code"] != 0:
+                    return self._fail(
+                        "生成 SSH 密钥失败: " + (r.get("stderr") or r.get("stdout") or "")[:200],
+                        "ERR_SSH_KEYGEN",
+                    )
+                try:
+                    os.chmod(key_path, 0o600)
+                    os.chmod(pub_path, 0o644)
+                except Exception:
+                    pass
+            with open(pub_path, "r") as f:
+                pub_key = f.read().strip()
+            if not pub_key:
+                return self._fail("公钥为空，建议删除 /root/.ssh/id_ed25519 重试", "ERR_SSH_EMPTY")
+            return self._ok(
+                {"pub_key": pub_key, "key_path": key_path, "pub_path": pub_path},
+                "公钥已就绪，可复制到主库",
+                "REPLICA_SSH_KEY_READY",
+            )
+        except Exception as ex:
+            return self._fail("生成/读取公钥失败: {}".format(ex), "ERR_SSH_GENERATE")
+
+    def master_install_replica_pubkey(self, get):
+        """Install a replica's SSH public key into the master's authorized_keys.
+
+        Idempotent: if the exact key line already exists we return without changes.
+        Requires the plugin to run as root (standard on BaoTa).
+        """
+        if not hasattr(get, "pub_key"):
+            return self._fail("缺少参数: pub_key", "ERR_PARAM_REQUIRED")
+        pub_key = str(get.pub_key).strip()
+        if not pub_key:
+            return self._fail("公钥不能为空", "ERR_PARAM_INVALID")
+        allowed_prefix = ("ssh-rsa ", "ssh-ed25519 ", "ssh-ecdsa ", "ecdsa-sha2-nistp256 ", "ecdsa-sha2-nistp384 ", "ecdsa-sha2-nistp521 ")
+        if not pub_key.startswith(allowed_prefix):
+            return self._fail("公钥格式不正确（需以 ssh-ed25519 / ssh-rsa / ecdsa 开头）", "ERR_PARAM_INVALID")
+        # Sanity: single line, not too long
+        if "\n" in pub_key or len(pub_key) > 8192:
+            # Allow trailing whitespace only — strip internal newlines
+            pub_key = pub_key.replace("\r", "").strip()
+            if "\n" in pub_key:
+                return self._fail("公钥必须是单行", "ERR_PARAM_INVALID")
+
+        if not self._is_root_user():
+            return self._fail("当前进程不是 root，无法写入 /root/.ssh/authorized_keys", "ERR_NOT_ROOT")
+
+        ssh_dir = "/root/.ssh"
+        auth_file = os.path.join(ssh_dir, "authorized_keys")
+        try:
+            if not os.path.isdir(ssh_dir):
+                os.makedirs(ssh_dir)
+            try:
+                os.chmod(ssh_dir, 0o700)
+            except Exception:
+                pass
+            existing = ""
+            if os.path.exists(auth_file):
+                try:
+                    with open(auth_file, "r") as f:
+                        existing = f.read()
+                except Exception:
+                    existing = ""
+            already = False
+            if existing:
+                for line in existing.splitlines():
+                    if line.strip() == pub_key:
+                        already = True
+                        break
+            if already:
+                data = self._load_config()
+                self._audit(data, "master_install_replica_pubkey", {"status": "already_installed"})
+                self._save_config(data)
+                return self._ok({"already_installed": True}, "该公钥已存在，无需重复安装", "MASTER_PUBKEY_EXISTS")
+
+            sep = "" if (not existing or existing.endswith("\n")) else "\n"
+            with open(auth_file, "a") as f:
+                f.write(sep + pub_key + "\n")
+            try:
+                os.chmod(auth_file, 0o600)
+            except Exception:
+                pass
+            data = self._load_config()
+            self._audit(data, "master_install_replica_pubkey", {"status": "installed"})
+            self._save_config(data)
+            return self._ok({"installed": True, "auth_file": auth_file}, "公钥已安装到主库 authorized_keys", "MASTER_PUBKEY_INSTALLED")
+        except Exception as ex:
+            return self._fail("写入 authorized_keys 失败: {}".format(ex), "ERR_PUBKEY_INSTALL")
+
+    def master_list_replica_pubkeys(self, get=None):
+        """List keys currently authorized in /root/.ssh/authorized_keys (best-effort)."""
+        auth_file = "/root/.ssh/authorized_keys"
+        if not os.path.exists(auth_file):
+            return self._ok({"keys": []}, "暂无 authorized_keys")
+        try:
+            with open(auth_file, "r") as f:
+                lines = f.read().splitlines()
+        except Exception as ex:
+            return self._fail("读取 authorized_keys 失败: {}".format(ex), "ERR_READ_AUTH_KEYS")
+        keys = []
+        for line in lines:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            parts = s.split()
+            if len(parts) >= 2:
+                fp = hashlib.sha256(parts[1].encode("utf-8")).hexdigest()[:16]
+                comment = parts[2] if len(parts) >= 3 else ""
+                keys.append({"type": parts[0], "fingerprint": fp, "comment": comment})
+        return self._ok({"keys": keys}, "已列出")
+
+    def replica_export_handshake(self, get=None):
+        """Produce a base64 handshake blob bundling this replica's SSH pubkey
+        plus identifying metadata, so the user can paste it into the master
+        plugin's "物理模式" card instead of raw pubkey text.
+
+        Payload schema:
+            {"type": "mms.handshake.v1",
+             "source_id": optional, carried through from the most recent
+                          imported profile (for audit),
+             "replica_ip": best-effort detected outbound IP,
+             "replica_hostname": gethostname(),
+             "pub_key": "ssh-ed25519 ...",
+             "created_at": ts, "expires_at": ts+24h}
+        """
+        key_res = self.replica_generate_ssh_key()
+        if not self._is_ok_result(key_res):
+            return key_res
+        pub_key = (key_res.get("msg") or {}).get("pub_key", "") if isinstance(key_res, dict) else ""
+        if not pub_key:
+            return self._fail("获取公钥失败", "ERR_SSH_EMPTY")
+        data = self._load_config()
+        last_sid = ""
+        try:
+            srcs = data.get("sources", []) or []
+            if srcs:
+                last_sid = srcs[0].get("source_id", "") or ""
+        except Exception:
+            pass
+        try:
+            import socket as _socket
+            hostname = _socket.gethostname()
+        except Exception:
+            hostname = ""
+        replica_ip = ""
+        try:
+            import socket as _sock
+            s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+            s.settimeout(1.5)
+            s.connect(("8.8.8.8", 80))
+            replica_ip = s.getsockname()[0]
+            s.close()
+        except Exception:
+            try:
+                import socket as _sock
+                replica_ip = _sock.gethostbyname(_sock.gethostname())
+            except Exception:
+                replica_ip = ""
+        payload = {
+            "type": "mms.handshake.v1",
+            "source_id": last_sid,
+            "replica_ip": replica_ip,
+            "replica_hostname": hostname,
+            "pub_key": pub_key,
+            "created_at": self._now(),
+            "expires_at": self._now() + 86400,
+        }
+        blob = base64.b64encode(json.dumps(payload, ensure_ascii=False).encode("utf-8")).decode("utf-8")
+        self._audit(data, "replica_export_handshake", {"source_id": last_sid, "len": len(blob)})
+        self._save_config(data)
+        return self._ok(
+            {"handshake_b64": blob, "pub_key": pub_key, "payload": payload},
+            "握手单已生成，请复制到主库'物理模式·粘贴握手单'",
+            "REPLICA_HANDSHAKE_EXPORTED",
+        )
+
+    def master_import_handshake(self, get):
+        """Accept either a raw ssh-* pubkey line OR a handshake blob produced by
+        replica_export_handshake. Installs the pubkey into authorized_keys.
+        """
+        if not hasattr(get, "payload"):
+            return self._fail("缺少参数: payload", "ERR_PARAM_REQUIRED")
+        raw = str(get.payload).strip()
+        if not raw:
+            return self._fail("内容不能为空", "ERR_PARAM_INVALID")
+        pub_key = ""
+        meta = {}
+        # First try base64 handshake; fall back to raw pubkey line.
+        parsed = None
+        try:
+            decoded = base64.b64decode(raw.encode("utf-8"), validate=False).decode("utf-8")
+            obj = json.loads(decoded)
+            if isinstance(obj, dict) and obj.get("type") == "mms.handshake.v1":
+                parsed = obj
+        except Exception:
+            parsed = None
+        if parsed:
+            pub_key = str(parsed.get("pub_key", "")).strip()
+            exp = int(parsed.get("expires_at", 0) or 0)
+            if exp and exp < self._now():
+                return self._fail("握手单已过期，请在从库重新生成", "ERR_HANDSHAKE_EXPIRED")
+            meta = {
+                "source_id": parsed.get("source_id", ""),
+                "replica_ip": parsed.get("replica_ip", ""),
+                "replica_hostname": parsed.get("replica_hostname", ""),
+            }
+        else:
+            pub_key = raw
+        if not pub_key:
+            return self._fail("未解析到公钥内容", "ERR_PARAM_INVALID")
+        # Delegate to the existing installer for validation + idempotent write.
+        res = self.master_install_replica_pubkey(public.to_dict_obj({"pub_key": pub_key}))
+        if isinstance(res, dict) and self._is_ok_result(res):
+            body = res.get("msg", {}) if isinstance(res.get("msg"), dict) else {}
+            body.update({"from_handshake": bool(parsed), "meta": meta})
+            if parsed:
+                try:
+                    data = self._load_config()
+                    self._audit(data, "master_import_handshake", meta)
+                    self._save_config(data)
+                except Exception:
+                    pass
+                return self._ok(body, "握手单已安装，物理模式已开通", "MASTER_HANDSHAKE_INSTALLED")
+        return res
+
+    def _is_ok_result(self, res):
+        try:
+            return bool(res.get("status")) if isinstance(res, dict) else False
+        except Exception:
+            return False
+
+    def replica_test_ssh_to_master(self, get):
+        """Quick SSH reachability probe from this (replica) host to the master.
+
+        Capped at ~8 seconds wall time so the UI never appears to hang:
+        ConnectTimeout=5 for TCP + up to 3s for auth. Disables known_hosts
+        mutation to avoid prompts / stalls on first connection.
+        """
+        if not hasattr(get, "master_host"):
+            return self._fail("缺少参数: master_host", "ERR_PARAM_REQUIRED")
+        master_host = str(get.master_host).strip()
+        if not master_host:
+            return self._fail("master_host 不能为空", "ERR_PARAM_INVALID")
+        ssh_user = str(getattr(get, "ssh_user", "root") or "root").strip() or "root"
+
+        # Pre-flight: raw TCP probe. If port 22 is closed, fail in 2s instead
+        # of waiting for ssh to time out.
+        try:
+            import socket as _sock
+            s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+            s.settimeout(2.0)
+            try:
+                s.connect((master_host, 22))
+                s.close()
+            except Exception as ex:
+                try: s.close()
+                except Exception: pass
+                return self._fail(
+                    "SSH 测试失败：无法连接 {}:22（{}）。请检查主库 22 端口是否开放、防火墙规则。".format(master_host, ex),
+                    "ERR_SSH_TCP",
+                )
+        except Exception:
+            pass
+
+        r = self._run_shell(
+            [
+                "ssh",
+                "-o", "BatchMode=yes",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "GlobalKnownHostsFile=/dev/null",
+                "-o", "LogLevel=ERROR",
+                "-o", "ConnectTimeout=5",
+                "-o", "ServerAliveInterval=2",
+                "-o", "ServerAliveCountMax=2",
+                "-o", "PreferredAuthentications=publickey",
+                "-o", "NumberOfPasswordPrompts=0",
+                "{}@{}".format(ssh_user, master_host),
+                "echo mms_ssh_ok",
+            ],
+            timeout=10,
+        )
+        if r["code"] == 0 and "mms_ssh_ok" in (r.get("stdout") or ""):
+            return self._ok({"reachable": True}, "SSH 免密连通正常，物理模式可用")
+        err = (r.get("stderr") or r.get("stdout") or "").strip()[:300] or "无错误输出"
+        hint = ""
+        lower = err.lower()
+        if "permission denied" in lower or "publickey" in lower:
+            hint = "公钥未被主库接受。请到主库\"物理模式 · 粘贴握手单\"把握手单粘贴进去，点击安装后再测试。"
+        elif "timed out" in lower or "connection refused" in lower or "no route" in lower:
+            hint = "SSH 网络不通，请检查主库 22 端口开放与防火墙。"
+        elif "timeout" in lower:
+            hint = "SSH 握手超时，可能是防火墙半连接或目标主机繁忙。"
+        return self._fail("SSH 测试失败: {} {}".format(err, hint).strip(), "ERR_SSH_TEST")
+
+    def master_list_accounts(self, get=None):
+        limit = 200
+        if get is not None and hasattr(get, "limit") and str(get.limit).strip().isdigit():
+            limit = int(get.limit)
+            if limit < 1:
+                limit = 1
+            if limit > 1000:
+                limit = 1000
+        try:
+            rows = self._query_sql(
+                "SELECT user, host FROM mysql.user "
+                "WHERE user IS NOT NULL AND user <> '' "
+                "ORDER BY user ASC, host ASC LIMIT {}".format(limit)
+            ) or []
+            result = []
+            for row in rows:
+                if isinstance(row, dict):
+                    user = row.get("user", "")
+                    host = row.get("host", "")
+                else:
+                    user = row[0] if len(row) > 0 else ""
+                    host = row[1] if len(row) > 1 else ""
+                user_txt = str(user or "")
+                host_txt = str(host or "")
+                if not user_txt:
+                    continue
+                grants = []
+                try:
+                    safe_user = self._sql_escape(user_txt)
+                    safe_host = self._sql_escape(host_txt)
+                    grant_rows = self._query_sql("SHOW GRANTS FOR '{}'@'{}'".format(safe_user, safe_host)) or []
+                    for g in grant_rows:
+                        if isinstance(g, dict):
+                            first_key = list(g.keys())[0] if g else ""
+                            if first_key:
+                                grants.append(str(g.get(first_key, "")))
+                        elif isinstance(g, (list, tuple)) and len(g) > 0:
+                            grants.append(str(g[0]))
+                except Exception:
+                    grants = []
+                result.append({
+                    "user": user_txt,
+                    "host": host_txt,
+                    "grants": grants,
+                })
+            return self._ok({"accounts": result}, "账号列表获取成功", "MASTER_ACCOUNTS_LISTED")
+        except Exception as ex:
+            return self._fail("获取账号列表失败: {}".format(ex), "ERR_MASTER_ACCOUNTS_LIST")
+
+    def master_update_account_password(self, get):
+        required = ["account_user", "account_host", "new_password"]
+        for k in required:
+            if not hasattr(get, k) or not str(get.__getattribute__(k)).strip():
+                return self._fail("缺少参数: {}".format(k), "ERR_PARAM")
+        user = str(get.account_user).strip()
+        host = str(get.account_host).strip()
+        new_password = str(get.new_password).strip()
+        try:
+            safe_user = self._sql_escape(user)
+            safe_host = self._sql_escape(host)
+            safe_pwd = self._sql_escape(new_password)
+            self._exec_sql("ALTER USER '{}'@'{}' IDENTIFIED BY '{}'".format(safe_user, safe_host, safe_pwd))
+            self._exec_sql("FLUSH PRIVILEGES")
+            data = self._load_config()
+            self._audit(data, "master_update_account_password", {"user": user, "host": host})
+            self._save_config(data)
+            return self._ok({}, "账号密码更新成功", "MASTER_ACCOUNT_PASSWORD_UPDATED")
+        except Exception as ex:
+            return self._fail("账号密码更新失败: {}".format(ex), "ERR_MASTER_ACCOUNT_PASSWORD")
+
+    def master_grant_account_privileges(self, get):
+        required = ["account_user", "account_host", "privileges"]
+        for k in required:
+            if not hasattr(get, k) or not str(get.__getattribute__(k)).strip():
+                return self._fail("缺少参数: {}".format(k), "ERR_PARAM")
+        user = str(get.account_user).strip()
+        host = str(get.account_host).strip()
+        privileges = str(get.privileges).strip().upper()
+        db_name = str(get.db_name).strip() if hasattr(get, "db_name") and str(get.db_name).strip() else "*"
+        table_name = str(get.table_name).strip() if hasattr(get, "table_name") and str(get.table_name).strip() else "*"
+        if not self._validate_privileges_text(privileges):
+            return self._fail("privileges 格式非法，仅支持字母、下划线、逗号与空格", "ERR_PRIVILEGES_FORMAT")
+        if db_name != "*" and not self._validate_mysql_scope_name(db_name):
+            return self._fail("db_name 格式非法", "ERR_DB_NAME_FORMAT")
+        if table_name != "*" and not self._validate_mysql_scope_name(table_name):
+            return self._fail("table_name 格式非法", "ERR_TABLE_NAME_FORMAT")
+        scope_db = "*" if db_name == "*" else "`{}`".format(db_name)
+        scope_table = "*" if table_name == "*" else "`{}`".format(table_name)
+        try:
+            safe_user = self._sql_escape(user)
+            safe_host = self._sql_escape(host)
+            grant_sql = "GRANT {} ON {}.{} TO '{}'@'{}'".format(privileges, scope_db, scope_table, safe_user, safe_host)
+            self._exec_sql(grant_sql)
+            self._exec_sql("FLUSH PRIVILEGES")
+            data = self._load_config()
+            self._audit(data, "master_grant_account_privileges", {
+                "user": user,
+                "host": host,
+                "privileges": privileges,
+                "scope": "{}.{}".format(db_name, table_name),
+            })
+            self._save_config(data)
+            return self._ok({}, "账号授权成功", "MASTER_ACCOUNT_PRIVILEGE_GRANTED")
+        except Exception as ex:
+            return self._fail("账号授权失败: {}".format(ex), "ERR_MASTER_ACCOUNT_GRANT")
 
     def master_export_signed_profile(self, get):
         required = ["source_id", "channel_name", "master_host", "master_port", "repl_user", "repl_password"]
         for k in required:
             if not hasattr(get, k):
-                return public.returnMsg(False, "missing parameter: {}".format(k))
+                return public.returnMsg(False, "缺少参数: {}".format(k))
         ttl = int(get.ttl_seconds) if hasattr(get, "ttl_seconds") and str(get.ttl_seconds).strip().isdigit() else 3600
         payload = {
             "source_id": str(get.source_id).strip(),
@@ -824,47 +1998,56 @@ class mysql_multi_source_main:
 
     def master_get_profile(self, get):
         if not hasattr(get, "profile_id"):
-            return public.returnMsg(False, "missing parameter: profile_id")
+            return public.returnMsg(False, "缺少参数: profile_id")
         data = self._load_config()
         pid = str(get.profile_id).strip()
         for p in data.get("master_profiles", []):
             if p.get("profile_id") == pid:
                 return public.returnMsg(True, p)
-        return public.returnMsg(False, "profile not found")
+        return public.returnMsg(False, "未找到该配置单")
 
     def replica_verify_profile(self, get):
         if not hasattr(get, "profile_b64"):
-            return public.returnMsg(False, "missing parameter: profile_b64")
+            return public.returnMsg(False, "缺少参数: profile_b64")
         try:
             raw = base64.b64decode(str(get.profile_b64).encode("utf-8")).decode("utf-8")
             obj = json.loads(raw)
             payload = obj.get("payload", {})
-            signature = obj.get("signature", "")
+            required_keys = ["source_id", "channel_name", "master_host", "master_port", "repl_user", "repl_password"]
+            missing = [k for k in required_keys if not payload.get(k)]
+            if missing:
+                return public.returnMsg(False, "配置单缺少必要字段: {}".format(", ".join(missing)))
             if int(payload.get("expires_at", 0)) < self._now():
-                return public.returnMsg(False, "profile expired")
-            ok = self._profile_verify(payload, signature)
-            return public.returnMsg(True, {"verified": ok, "payload": payload, "signature": signature})
+                return public.returnMsg(False, "配置单已过期，请在主库重新导出")
+            return public.returnMsg(True, {"verified": True, "payload": payload})
+        except (ValueError, TypeError) as ex:
+            return public.returnMsg(False, "配置单格式错误，请确认粘贴完整: {}".format(ex))
         except Exception as ex:
-            return public.returnMsg(False, "profile parse error: {}".format(ex))
+            return public.returnMsg(False, "配置单解析失败: {}".format(ex))
 
     def replica_import_profile(self, get):
         verify = self.replica_verify_profile(get)
         if verify.get("status") is False:
             return verify
-        if not verify.get("msg", {}).get("verified"):
-            return public.returnMsg(False, "profile signature verify failed")
-        payload = verify["msg"]["payload"]
+        msg = verify.get("msg", {}) if isinstance(verify.get("msg"), dict) else {}
+        if not msg.get("verified"):
+            return self._fail("配置单签名校验失败，请重新导出", "ERR_PROFILE_SIGNATURE")
+        payload = msg.get("payload", {})
         data = self._load_config()
         sid = payload.get("source_id")
         if self._find_source(data, sid):
-            return public.returnMsg(False, "source_id already exists")
+            return self._fail("该数据源ID已存在", "ERR_DUPLICATE")
+        raw_pwd = payload.get("repl_password", "")
+        # payload may already be encrypted if exported from new version; decrypt then re-encrypt consistently
+        if isinstance(raw_pwd, str) and raw_pwd.startswith(self.CRYPTO_PREFIX):
+            raw_pwd = self._crypto_decrypt(raw_pwd)
         source = {
             "source_id": sid,
             "channel_name": payload.get("channel_name"),
             "master_host": payload.get("master_host"),
             "master_port": int(payload.get("master_port", 3306)),
             "repl_user": payload.get("repl_user"),
-            "repl_password": payload.get("repl_password"),
+            "repl_password": self._crypto_encrypt(raw_pwd or ""),
             "sync_mode": "gtid",
             "db_mappings": payload.get("db_mappings", []),
             "init_strategy": "auto",
@@ -875,7 +2058,7 @@ class mysql_multi_source_main:
         data["sources"].append(source)
         self._audit(data, "replica_import_profile", {"source_id": sid})
         self._save_config(data)
-        return public.returnMsg(True, "profile导入成功")
+        return self._ok({"source_id": sid}, "profile导入成功", "PROFILE_IMPORTED")
 
     def master_create_handshake(self, get):
         if not hasattr(get, "profile_b64"):
@@ -963,19 +2146,24 @@ class mysql_multi_source_main:
         result = []
         for source in data.get("sources", []):
             item = dict(source)
-            item["repl_password"] = self._mask_secret(item.get("repl_password"))
+            # UI never needs the ciphertext; show mask of plaintext length only
+            plain = self._crypto_decrypt(item.get("repl_password", ""))
+            item["repl_password"] = self._mask_secret(plain)
+            item["has_password"] = bool(plain)
             result.append(item)
         return public.returnMsg(True, result)
 
     def source_detail(self, get):
         if not hasattr(get, "source_id"):
-            return public.returnMsg(False, "missing parameter: source_id")
+            return self._fail("缺少参数: source_id", "ERR_PARAM_REQUIRED")
         data = self._load_config()
         item = self._find_source(data, str(get.source_id).strip())
         if not item:
-            return public.returnMsg(False, "source not found")
+            return self._fail("未找到该数据源", "ERR_NOT_FOUND")
         result = dict(item)
-        result["repl_password"] = self._mask_secret(result.get("repl_password"))
+        plain = self._crypto_decrypt(result.get("repl_password", ""))
+        result["repl_password"] = self._mask_secret(plain)
+        result["has_password"] = bool(plain)
         return public.returnMsg(True, result)
 
     def add_source(self, get):
@@ -989,7 +2177,7 @@ class mysql_multi_source_main:
         ]
         for key in required:
             if not hasattr(get, key) or not str(get.__getattribute__(key)).strip():
-                return self._fail("missing parameter: {}".format(key), "ERR_PARAM_REQUIRED")
+                return self._fail("缺少参数: {}".format(key), "ERR_PARAM_REQUIRED")
         source_id = str(get.source_id).strip()
         if not self._validate_source_id(source_id):
             return self._fail("source_id 仅支持字母、数字、下划线、中划线，最长64位", "ERR_PARAM_INVALID")
@@ -998,16 +2186,16 @@ class mysql_multi_source_main:
         try:
             master_port = int(get.master_port)
         except Exception:
-            return self._fail("master_port must be integer", "ERR_PARAM_INVALID")
+            return self._fail("端口号必须为整数", "ERR_PARAM_INVALID")
         if master_port < 1 or master_port > 65535:
-            return self._fail("master_port out of range(1-65535)", "ERR_PARAM_INVALID")
+            return self._fail("端口号超出范围（1-65535）", "ERR_PARAM_INVALID")
 
         data = self._load_config()
         if self._find_source(data, source_id):
-            return self._fail("source_id already exists", "ERR_DUPLICATE")
+            return self._fail("该数据源ID已存在", "ERR_DUPLICATE")
         for source in data.get("sources", []):
             if source.get("channel_name") == str(get.channel_name).strip():
-                return self._fail("channel_name already exists", "ERR_DUPLICATE")
+                return self._fail("该通道名称已存在", "ERR_DUPLICATE")
 
         source = {
             "source_id": source_id,
@@ -1015,10 +2203,10 @@ class mysql_multi_source_main:
             "master_host": str(get.master_host).strip(),
             "master_port": master_port,
             "repl_user": str(get.repl_user).strip(),
-            "repl_password": str(get.repl_password).strip(),
+            "repl_password": self._crypto_encrypt(str(get.repl_password)),
             "sync_mode": "gtid",
             "db_mappings": [],
-            "init_strategy": "physical",
+            "init_strategy": "auto",
             "status": {
                 "running": False,
                 "io_running": "No",
@@ -1031,10 +2219,11 @@ class mysql_multi_source_main:
         }
         data["sources"].append(source)
         self._append_log(source["source_id"], "添加主库来源成功，channel={}".format(source["channel_name"]))
+        self._audit(data, "add_source", {"source_id": source_id, "channel_name": source["channel_name"]})
 
         if not self._save_config(data):
-            return self._fail("save config failed", "ERR_SAVE_CONFIG")
-        return self._ok({"source_id": source_id}, "来源添加成功")
+            return self._fail("保存配置失败", "ERR_SAVE_CONFIG")
+        return self._ok({"source_id": source_id}, "来源添加成功", "SOURCE_ADDED")
 
     def test_source_connection(self, get):
         if not hasattr(get, "source_id"):
@@ -1061,27 +2250,60 @@ class mysql_multi_source_main:
         required = ["master_host", "master_port", "repl_user", "repl_password"]
         for k in required:
             if not hasattr(get, k) or not str(get.__getattribute__(k)).strip():
-                return public.returnMsg(False, "missing parameter: {}".format(k))
+                return self._fail("缺少参数: {}".format(k), "ERR_PARAM_REQUIRED")
         host = str(get.master_host).strip()
-        port = int(get.master_port)
-        user = self._sql_escape(get.repl_user)
-        pwd = self._sql_escape(get.repl_password)
+        try:
+            port = int(get.master_port)
+        except Exception:
+            return self._fail("端口号必须为整数", "ERR_PARAM_INVALID")
+        user = str(get.repl_user).strip()
+        pwd = str(get.repl_password)
+
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(3)
         try:
             sock.connect((host, port))
         except Exception as ex:
-            return public.returnMsg(False, {"ok": False, "msg": "网络连通失败: {}".format(ex), "reason": self._classify_connectivity_error(ex)})
-        finally:
             sock.close()
-        try:
-            cmd = "export MYSQL_PWD='{}' && mysql -h '{}' -P{} -u'{}' -e \"select 1\" && unset MYSQL_PWD".format(pwd, host, port, user)
-            out, err = public.ExecShell(cmd)
-            if err and err.strip():
-                return public.returnMsg(False, {"ok": False, "msg": err.strip(), "reason": self._classify_connectivity_error(err)})
-            return public.returnMsg(True, {"ok": True, "msg": "网络与账号校验通过", "reason": "可连接并可执行查询"})
-        except Exception as ex:
-            return public.returnMsg(False, {"ok": False, "msg": str(ex), "reason": self._classify_connectivity_error(ex)})
+            return self._fail(
+                "网络连通失败: {}".format(ex),
+                "ERR_NETWORK",
+                {"ok": False, "reason": self._classify_connectivity_error(ex)},
+            )
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+        if not self._check_command_exists("mysql"):
+            return self._ok(
+                {"ok": True, "reason": "仅验证网络层，未检测到本地 mysql 客户端，跳过账号校验"},
+                "网络已连通；未校验账号（建议安装 mysql 客户端）",
+                "MASTER_CONNECT_NET_ONLY",
+            )
+
+        r = self._run_shell(
+            ["mysql",
+             "-h", host,
+             "-P", str(port),
+             "-u", user,
+             "-e", "SELECT 1"],
+            env_extra={"MYSQL_PWD": pwd},
+            timeout=15,
+        )
+        if r["code"] != 0:
+            err = (r.get("stderr") or "").strip() or "mysql 退出码 {}".format(r["code"])
+            return self._fail(
+                err,
+                "ERR_MASTER_AUTH" if "access denied" in err.lower() else "ERR_MASTER_CONNECT",
+                {"ok": False, "reason": self._classify_connectivity_error(err)},
+            )
+        return self._ok(
+            {"ok": True, "reason": "可连接并可执行查询"},
+            "网络与账号校验通过",
+            "MASTER_CONNECT_OK",
+        )
 
     def get_gtid_status(self, get=None):
         try:
@@ -1095,30 +2317,30 @@ class mysql_multi_source_main:
 
     def set_db_mappings(self, get):
         if not hasattr(get, "source_id"):
-            return self._fail("missing parameter: source_id", "ERR_PARAM_REQUIRED")
+            return self._fail("缺少参数: source_id", "ERR_PARAM_REQUIRED")
         if not hasattr(get, "mappings"):
-            return self._fail("missing parameter: mappings", "ERR_PARAM_REQUIRED")
+            return self._fail("缺少参数: mappings", "ERR_PARAM_REQUIRED")
 
         data = self._load_config()
         item = self._find_source(data, str(get.source_id).strip())
         if not item:
-            return self._fail("source not found", "ERR_NOT_FOUND")
+            return self._fail("未找到该数据源", "ERR_NOT_FOUND")
 
         try:
             mappings = get.mappings
             if isinstance(mappings, str):
                 mappings = json.loads(mappings)
             if not isinstance(mappings, list):
-                return self._fail("mappings must be a list", "ERR_PARAM_INVALID")
+                return self._fail("mappings 必须为列表格式", "ERR_PARAM_INVALID")
 
             normalized = []
             for m in mappings:
                 if not isinstance(m, dict):
-                    return self._fail("mapping item must be object", "ERR_PARAM_INVALID")
+                    return self._fail("映射项格式不正确", "ERR_PARAM_INVALID")
                 source_db = str(m.get("source_db", "")).strip()
                 target_db = str(m.get("target_db", "")).strip()
                 if not source_db or not target_db:
-                    return self._fail("source_db and target_db are required", "ERR_PARAM_REQUIRED")
+                    return self._fail("源数据库和目标数据库不能为空", "ERR_PARAM_REQUIRED")
                 normalized.append({"source_db": source_db, "target_db": target_db})
             item["db_mappings"] = normalized
             item["updated_at"] = self._now()
@@ -1126,7 +2348,7 @@ class mysql_multi_source_main:
             self._save_config(data)
             return self._ok({"source_id": item.get("source_id"), "count": len(normalized)}, "库映射更新成功")
         except Exception as ex:
-            return self._fail("mappings parse failed: {}".format(ex), "ERR_PARSE_MAPPINGS")
+            return self._fail("映射配置解析失败: {}".format(ex), "ERR_PARSE_MAPPINGS")
 
     def list_db_mappings(self, get):
         if not hasattr(get, "source_id"):
@@ -1139,7 +2361,7 @@ class mysql_multi_source_main:
 
     def remove_source(self, get):
         if not hasattr(get, "source_id"):
-            return public.returnMsg(False, "missing parameter: source_id")
+            return self._fail("缺少参数: source_id", "ERR_PARAM_REQUIRED")
         source_id = str(get.source_id).strip()
 
         data = self._load_config()
@@ -1147,30 +2369,56 @@ class mysql_multi_source_main:
         old_len = len(data.get("sources", []))
         data["sources"] = [s for s in data.get("sources", []) if s.get("source_id") != source_id]
         if len(data["sources"]) == old_len:
-            return public.returnMsg(False, "source not found")
+            return self._fail("未找到该数据源", "ERR_NOT_FOUND")
+
+        # Cancel related bootstrap tasks to avoid stale worker writes resurrecting source.
+        cancelled_task_ids = []
+        for t in data.get("bootstrap_tasks", []) or []:
+            if t.get("source_id") != source_id:
+                continue
+            if t.get("status") in ("done", "failed", "cancelled"):
+                continue
+            t["status"] = "cancelled"
+            t["current_step"] = "来源已删除，任务取消"
+            t["error"] = "source removed by user"
+            self._heartbeat_task(t)
+            cancelled_task_ids.append(t.get("task_id"))
+
+        # best-effort: stop channel before removal (ignore errors)
+        if item and self._validate_channel_name(item.get("channel_name", "")):
+            try:
+                self._exec_sql("STOP SLAVE FOR CHANNEL '{}'".format(self._sql_escape(item.get("channel_name"))))
+            except Exception:
+                pass
+
         if item:
             self._append_log(source_id, "删除来源")
+        self._audit(data, "remove_source", {"source_id": source_id, "cancelled_tasks": cancelled_task_ids})
         if not self._save_config(data):
-            return public.returnMsg(False, "save config failed")
-        return public.returnMsg(True, "来源已删除")
+            return self._fail("保存配置失败", "ERR_SAVE_CONFIG")
+        for tid in cancelled_task_ids:
+            if tid:
+                self._append_task_log(tid, "cancelled because source {} removed".format(source_id))
+        return self._ok({"source_id": source_id}, "来源已删除", "SOURCE_REMOVED")
 
     def start_channel(self, get):
         if not hasattr(get, "source_id"):
-            return public.returnMsg(False, "missing parameter: source_id")
+            return self._fail("缺少参数: source_id", "ERR_PARAM_REQUIRED")
 
         data = self._load_config()
         item = self._find_source(data, str(get.source_id).strip())
         if not item:
-            return public.returnMsg(False, "source not found")
+            return self._fail("未找到该数据源", "ERR_NOT_FOUND")
         channel_name = item.get("channel_name")
         if not self._validate_channel_name(channel_name):
-            return public.returnMsg(False, "invalid channel_name")
+            return self._fail("通道名称无效", "ERR_PARAM_INVALID")
 
         safe_channel = self._sql_escape(channel_name)
         master_host = self._sql_escape(item.get("master_host"))
         master_port = int(item.get("master_port", 3306))
         repl_user = self._sql_escape(item.get("repl_user"))
-        repl_password = self._sql_escape(item.get("repl_password"))
+        plain_pwd = self._decrypted_password(item)
+        repl_password = self._sql_escape(plain_pwd)
 
         try:
             self._exec_sql("STOP SLAVE FOR CHANNEL '{}'".format(safe_channel))
@@ -1198,13 +2446,13 @@ class mysql_multi_source_main:
             item["status"]["last_error"] = "启动失败: {}".format(ex)
             item["updated_at"] = self._now()
             self._save_config(data)
-            return public.returnMsg(False, item["status"]["last_error"])
+            return self._fail(item["status"]["last_error"], "ERR_START_CHANNEL")
 
         item["status"] = self._get_source_status(channel_name)
         item["updated_at"] = self._now()
         self._append_log(item["source_id"], "启动 channel 成功")
         self._save_config(data)
-        return public.returnMsg(True, "通道启动成功")
+        return self._ok({"source_id": item["source_id"], "status": item["status"]}, "通道启动成功", "CHANNEL_STARTED")
 
     def stop_channel(self, get):
         if not hasattr(get, "source_id"):
@@ -1247,17 +2495,17 @@ class mysql_multi_source_main:
 
     def create_bootstrap_task(self, get):
         if not hasattr(get, "source_id"):
-            return self._fail("missing parameter: source_id", "ERR_PARAM_REQUIRED")
+            return self._fail("缺少参数: source_id", "ERR_PARAM_REQUIRED")
         mode = "auto"
         if hasattr(get, "mode") and str(get.mode).strip():
             mode = str(get.mode).strip()
         if mode not in ["auto", "physical", "logical"]:
-            return self._fail("mode must be auto/physical/logical", "ERR_PARAM_INVALID")
+            return self._fail("模式参数无效，仅支持 auto/physical/logical", "ERR_PARAM_INVALID")
 
         data = self._load_config()
         source = self._find_source(data, str(get.source_id).strip())
         if not source:
-            return self._fail("source not found", "ERR_NOT_FOUND")
+            return self._fail("未找到该数据源", "ERR_NOT_FOUND")
         if not source.get("db_mappings"):
             return self._fail("请先配置库映射后再创建初始化任务", "ERR_MAPPINGS_EMPTY")
 
@@ -1302,30 +2550,56 @@ class mysql_multi_source_main:
         incoming_worker = ""
         if hasattr(get, "worker_id"):
             incoming_worker = str(get.worker_id).strip()
+
+        # Atomic CAS: only one caller can flip pending -> running. If another
+        # worker is already running this task we silently bail (prevents the
+        # thread-primary + subprocess-backup pair from double-executing).
+        def _claim(d):
+            t = self._find_bootstrap_task(d, task_id)
+            if not t:
+                return ("missing", None)
+            st = t.get("status")
+            if st == "done":
+                return ("done", t)
+            if st == "cancelled":
+                return ("cancelled", t)
+            if st == "running":
+                cur = t.get("worker_id") or ""
+                if cur and incoming_worker and cur != incoming_worker:
+                    return ("busy", t)
+                # same worker re-entering (e.g. recovery), allow.
+            t["status"] = "running"
+            t["progress"] = t.get("progress") or 0
+            t["current_step"] = t.get("current_step") or "初始化开始"
+            t["started_at"] = t.get("started_at") or self._now()
+            if incoming_worker:
+                t["worker_id"] = incoming_worker
+            elif not t.get("worker_id"):
+                t["worker_id"] = "worker_" + uuid.uuid4().hex[:8]
+            t["error"] = ""
+            t["error_type"] = ""
+            t["updated_at"] = self._now()
+            t["last_heartbeat"] = self._now()
+            return ("claimed", t)
+        flag, task = self._update_config(_claim)
+        if flag == "missing":
+            return public.returnMsg(False, "task not found")
+        if flag == "done":
+            return public.returnMsg(True, "任务已完成")
+        if flag == "cancelled":
+            return public.returnMsg(False, "任务已取消")
+        if flag == "busy":
+            try:
+                self._append_task_log(task_id, "worker={} 未抢占到任务（已在其他worker执行）".format(incoming_worker or "-"))
+            except Exception:
+                pass
+            return public.returnMsg(False, "任务已被其他worker接管")
+        # Re-load so downstream logic has a consistent snapshot.
         data = self._load_config()
         task = self._find_bootstrap_task(data, task_id)
         if not task:
             return public.returnMsg(False, "task not found")
-        if task.get("status") == "done":
-            return public.returnMsg(True, "任务已完成")
-        if task.get("status") == "cancelled":
-            return public.returnMsg(False, "任务已取消")
-        if task.get("status") == "running" and task.get("worker_id") and incoming_worker and incoming_worker != task.get("worker_id"):
-            return public.returnMsg(False, "任务已被其他worker接管")
-
-        task["status"] = "running"
-        task["progress"] = 0
-        task["current_step"] = "初始化开始"
-        task["started_at"] = task.get("started_at") or self._now()
-        if incoming_worker:
-            task["worker_id"] = incoming_worker
-        elif not task.get("worker_id"):
-            task["worker_id"] = "worker_" + uuid.uuid4().hex[:8]
-        task["error"] = ""
-        task["error_type"] = ""
-        task["updated_at"] = self._now()
-        task["last_heartbeat"] = self._now()
-        self._save_config(data)
+        self._append_task_log(task_id, "worker={} 抢占成功，开始执行".format(task.get("worker_id")))
 
         try:
             source = self._find_source(data, task.get("source_id"))
@@ -1394,13 +2668,13 @@ class mysql_multi_source_main:
 
     def trigger_bootstrap_task(self, get):
         if not hasattr(get, "task_id"):
-            return self._fail("missing parameter: task_id", "ERR_PARAM_REQUIRED")
+            return self._fail("缺少参数: task_id", "ERR_PARAM_REQUIRED")
         task_id = str(get.task_id).strip()
 
         data = self._load_config()
         task = self._find_bootstrap_task(data, task_id)
         if not task:
-            return self._fail("task not found", "ERR_NOT_FOUND")
+            return self._fail("未找到该任务", "ERR_NOT_FOUND")
         if task.get("status") == "running":
             return self._fail("任务正在执行中", "ERR_TASK_RUNNING")
         if task.get("status") == "done":
@@ -1409,13 +2683,75 @@ class mysql_multi_source_main:
         worker_id = "worker_" + uuid.uuid4().hex[:8]
         task["worker_id"] = worker_id
         task["last_heartbeat"] = self._now()
+        task["retry_count"] = 0
+        task["error"] = ""
+        task["error_type"] = ""
         self._save_config(data)
 
-        cmd = "nohup btpython /www/server/panel/plugin/mysql_multi_source/start_sync.py run_bootstrap_task {} {} > /dev/null 2>&1 &".format(
-            task_id, worker_id
-        )
-        public.ExecShell(cmd)
+        self._append_task_log(task_id, "======== 触发新一轮执行 worker={} ========".format(worker_id))
         self._append_log(task.get("source_id"), "异步触发初始化任务: {} by {}".format(task_id, worker_id))
+
+        # ---- Primary path: in-process daemon thread (survives HTTP response,
+        # always works inside BaoTa's running Flask process, no pyenv/import
+        # hazards). CAS inside run_bootstrap_task prevents double-execution if
+        # the subprocess backup below also claims the same worker_id.
+        thread_ok = False
+        def _bg_run():
+            try:
+                self._append_task_log(task_id, "[thread] 进入 run_bootstrap_task")
+                self.run_bootstrap_task(public.to_dict_obj({"task_id": task_id, "worker_id": worker_id}))
+                self._append_task_log(task_id, "[thread] run_bootstrap_task 返回")
+            except Exception as ex:
+                try:
+                    import traceback as _tb
+                    self._append_task_log(task_id, "[thread] 失败: {}\n{}".format(ex, _tb.format_exc()[:2000]))
+                except Exception:
+                    pass
+        try:
+            threading.Thread(target=_bg_run, daemon=True).start()
+            thread_ok = True
+            self._append_task_log(task_id, "[thread] 已启动（主执行路径）")
+        except Exception as ex:
+            self._append_task_log(task_id, "[thread] 启动失败: {}".format(ex))
+
+        # ---- Backup path: detached subprocess via btpython/start_sync.py.
+        # stderr/stdout captured to a per-task file so we can *see* why it died
+        # instead of silent failure. If the thread already ran to completion,
+        # run_bootstrap_task's CAS will turn this into a no-op cheaply.
+        launcher = "/www/server/panel/plugin/mysql_multi_source/start_sync.py"
+        btpython = "/www/server/panel/pyenv/bin/python"
+        python_bin = btpython if os.path.exists(btpython) else (
+            "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else "python3"
+        )
+        if not os.path.exists(launcher):
+            self._append_task_log(task_id, "[subproc] 跳过: {} 不存在（仅使用线程路径）".format(launcher))
+        else:
+            err_dir = "/www/server/panel/plugin/mysql_multi_source"
+            stderr_path = os.path.join(err_dir, "{}.stderr.log".format(task_id))
+            try:
+                err_fp = open(stderr_path, "ab")
+                try:
+                    err_fp.write("\n==== {} spawn by {} ====\n".format(time.strftime("%Y-%m-%d %H:%M:%S"), worker_id).encode("utf-8"))
+                    err_fp.flush()
+                except Exception:
+                    pass
+                subprocess.Popen(
+                    [python_bin, launcher, "run_bootstrap_task", task_id, worker_id],
+                    stdout=err_fp,
+                    stderr=err_fp,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+                self._append_task_log(
+                    task_id,
+                    "[subproc] 已拉起（备份路径）bin={} stderr={}".format(python_bin, stderr_path),
+                )
+            except Exception as ex:
+                self._append_task_log(task_id, "[subproc] 拉起失败: {}".format(ex))
+
+        if not thread_ok:
+            return self._fail("任务触发失败：线程和子进程均未能启动", "ERR_TRIGGER_FAIL")
         return self._ok({"task_id": task_id, "worker_id": worker_id}, "已触发后台执行")
 
     def get_bootstrap_tasks(self, get=None):
@@ -1597,3 +2933,672 @@ class mysql_multi_source_main:
                 "avg_bootstrap_duration_seconds": avg_duration,
             },
         )
+
+    # =======================================================================
+    # Wizard / orchestrator APIs
+    # =======================================================================
+
+    def _all_slave_status(self):
+        """Fetch SHOW SLAVE STATUS once and return {channel_name: row}."""
+        out = {}
+        try:
+            rows = self._query_sql("SHOW SLAVE STATUS")
+        except Exception:
+            return out
+        if not isinstance(rows, (list, tuple)):
+            try:
+                rows = self._query_sql("SHOW REPLICA STATUS")
+            except Exception:
+                return out
+        if not isinstance(rows, (list, tuple)) or not rows:
+            return out
+        for row in rows:
+            if isinstance(row, dict):
+                name = row.get("Channel_Name") or row.get("channel_name") or ""
+                out[str(name)] = row
+        return out
+
+    def _map_status_row(self, row):
+        if not isinstance(row, dict):
+            return {
+                "running": False, "io_running": "No", "sql_running": "No",
+                "seconds_behind": None, "last_error": "",
+            }
+        io_running = row.get("Slave_IO_Running", row.get("Replica_IO_Running", "No"))
+        sql_running = row.get("Slave_SQL_Running", row.get("Replica_SQL_Running", "No"))
+        seconds_behind = row.get("Seconds_Behind_Master", row.get("Seconds_Behind_Source"))
+        last_error = row.get("Last_Error", "") or row.get("Last_IO_Error", "") or row.get("Last_SQL_Error", "")
+        return {
+            "running": io_running == "Yes" and sql_running == "Yes",
+            "io_running": io_running,
+            "sql_running": sql_running,
+            "seconds_behind": seconds_behind,
+            "last_error": last_error,
+        }
+
+    def wizard_detect_env(self, get=None):
+        """Aggregate identity, tools, GTID and summary counts for landing."""
+        data = self._load_config()
+        sources = data.get("sources", []) or []
+        tasks = data.get("bootstrap_tasks", []) or []
+        running_sources = 0
+        try:
+            status_map = self._all_slave_status()
+            for s in sources:
+                row = status_map.get(s.get("channel_name") or "", None)
+                if self._map_status_row(row or {}).get("running"):
+                    running_sources += 1
+        except Exception:
+            pass
+
+        try:
+            tools_resp = self.check_bootstrap_tools()
+            tools = tools_resp.get("msg", {}) if isinstance(tools_resp, dict) else {}
+        except Exception:
+            tools = {}
+
+        gtid_enabled = False
+        gtid_value = ""
+        try:
+            rows = self._query_sql("SHOW VARIABLES LIKE 'gtid_mode'") or []
+            if rows:
+                val = rows[0][1] if not isinstance(rows[0], dict) else rows[0].get("Value", "")
+                gtid_value = str(val)
+                gtid_enabled = gtid_value.upper() == "ON"
+        except Exception:
+            pass
+
+        mysql_version = ""
+        try:
+            rows = self._query_sql("SELECT VERSION() as v") or []
+            if rows:
+                mysql_version = (rows[0].get("v") if isinstance(rows[0], dict) else rows[0][0]) or ""
+        except Exception:
+            pass
+
+        suggested_mode = data.get("mode", "replica_mode")
+        try:
+            detect = self.detect_running_mode()
+            dm = detect.get("msg", {}) if isinstance(detect, dict) else {}
+            if dm.get("suggested_mode"):
+                suggested_mode = dm["suggested_mode"]
+        except Exception:
+            pass
+
+        pending_tasks = len([t for t in tasks if t.get("status") in ("pending", "running")])
+
+        master_setup = data.get("master_setup") or None
+        master_health_ok = False
+        if master_setup:
+            try:
+                hc = self.master_health_check()
+                hc_data = hc.get("msg", {}) if isinstance(hc, dict) else {}
+                hc_summary = hc_data.get("summary", {})
+                master_health_ok = hc_summary.get("fail", 1) == 0
+            except Exception:
+                pass
+
+        server_ip = ""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            server_ip = s.getsockname()[0]
+            s.close()
+        except Exception:
+            try:
+                server_ip = socket.gethostbyname(socket.gethostname())
+            except Exception:
+                pass
+
+        mysql_port = 3306
+        try:
+            port_rows = self._query_sql("SHOW VARIABLES LIKE 'port'")
+            if port_rows:
+                mysql_port = int(port_rows[0][1] if not isinstance(port_rows[0], dict) else port_rows[0].get("Value", 3306))
+        except Exception:
+            pass
+
+        return self._ok(
+            {
+                "saved_mode": data.get("mode", "replica_mode"),
+                "suggested_mode": suggested_mode,
+                "mysql_version": mysql_version,
+                "gtid": {"mode": gtid_value, "enabled": gtid_enabled},
+                "tools": tools,
+                "counts": {
+                    "sources": len(sources),
+                    "running_sources": running_sources,
+                    "bootstrap_tasks": len(tasks),
+                    "pending_tasks": pending_tasks,
+                },
+                "plugin_version": self.CONFIG_SCHEMA_VERSION,
+                "server_ip": server_ip,
+                "mysql_port": mysql_port,
+                "master_setup": {
+                    "configured": bool(master_setup),
+                    "configured_at": master_setup.get("configured_at", "") if master_setup else "",
+                    "repl_user": master_setup.get("repl_user", "") if master_setup else "",
+                    "health_ok": master_health_ok,
+                } if master_setup else None,
+            },
+            "环境扫描完成",
+            "ENV_DETECTED",
+        )
+
+    def wizard_preflight_source(self, get):
+        """Three-axis connectivity check for replica → master.
+
+        Inputs: master_host, master_port, repl_user, repl_password OR
+                source_id (pull from existing config).
+        Returns: {network, auth, gtid} each with ok/reason.
+        """
+        if get is None:
+            return self._fail("缺少必要参数", "ERR_PARAM_REQUIRED")
+        host = getattr(get, "master_host", "") or ""
+        port_str = getattr(get, "master_port", "3306") or "3306"
+        user = getattr(get, "repl_user", "") or ""
+        pwd = getattr(get, "repl_password", "") or ""
+
+        if hasattr(get, "source_id") and str(get.source_id).strip():
+            data = self._load_config()
+            src = self._find_source(data, str(get.source_id).strip())
+            if src:
+                host = host or src.get("master_host", "")
+                port_str = port_str or str(src.get("master_port", 3306))
+                user = user or src.get("repl_user", "")
+                pwd = pwd or self._decrypted_password(src)
+
+        host = str(host).strip()
+        try:
+            port = int(port_str)
+        except Exception:
+            return self._fail("master_port 非法", "ERR_PARAM_INVALID")
+        user = str(user).strip()
+        pwd = str(pwd)
+
+        if not host or not user or not pwd:
+            return self._fail("缺少主库地址/账号/密码", "ERR_PARAM_REQUIRED")
+
+        result = {
+            "network": {"ok": False, "reason": ""},
+            "auth": {"ok": False, "reason": ""},
+            "gtid": {"ok": False, "reason": ""},
+        }
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        try:
+            sock.connect((host, port))
+            result["network"] = {"ok": True, "reason": "TCP 已连通"}
+        except Exception as ex:
+            result["network"] = {"ok": False, "reason": self._classify_connectivity_error(ex) + ": " + str(ex)}
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+        if result["network"]["ok"] and self._check_command_exists("mysql"):
+            r = self._run_shell(
+                ["mysql", "-h", host, "-P", str(port), "-u", user, "-e",
+                 "SELECT 1; SHOW VARIABLES LIKE 'gtid_mode'"],
+                env_extra={"MYSQL_PWD": pwd},
+                timeout=15,
+            )
+            if r["code"] == 0:
+                result["auth"] = {"ok": True, "reason": "账号可执行查询"}
+                stdout = r.get("stdout") or ""
+                if "ON" in stdout:
+                    result["gtid"] = {"ok": True, "reason": "gtid_mode=ON"}
+                else:
+                    result["gtid"] = {"ok": False, "reason": "主库 gtid_mode 非 ON，建议开启"}
+            else:
+                err = (r.get("stderr") or "").strip()
+                reason = self._classify_connectivity_error(err)
+                result["auth"] = {"ok": False, "reason": reason + ": " + err[:200]}
+                result["gtid"] = {"ok": False, "reason": "账号校验未通过，无法检测 GTID"}
+        else:
+            if not self._check_command_exists("mysql"):
+                result["auth"] = {"ok": False, "reason": "本机未安装 mysql 客户端，无法校验账号"}
+                result["gtid"] = {"ok": False, "reason": "无法检测"}
+
+        all_ok = all(result[k]["ok"] for k in ("network", "auth", "gtid"))
+        return self._ok({"checks": result, "all_ok": all_ok}, "连通性检查完成", "PREFLIGHT_OK")
+
+    def wizard_list_master_dbs(self, get):
+        """SHOW DATABASES on master (filtered to user DBs) with size estimate."""
+        if get is None:
+            return self._fail("缺少必要参数", "ERR_PARAM_REQUIRED")
+
+        host = getattr(get, "master_host", "") or ""
+        port_str = getattr(get, "master_port", "3306") or "3306"
+        user = getattr(get, "repl_user", "") or ""
+        pwd = getattr(get, "repl_password", "") or ""
+
+        if hasattr(get, "source_id") and str(get.source_id).strip():
+            data = self._load_config()
+            src = self._find_source(data, str(get.source_id).strip())
+            if src:
+                host = host or src.get("master_host", "")
+                port_str = port_str or str(src.get("master_port", 3306))
+                user = user or src.get("repl_user", "")
+                pwd = pwd or self._decrypted_password(src)
+
+        host = str(host).strip()
+        try:
+            port = int(port_str)
+        except Exception:
+            return self._fail("master_port 非法", "ERR_PARAM_INVALID")
+        user = str(user).strip()
+
+        if not host or not user or not pwd:
+            return self._fail("缺少主库连接信息", "ERR_PARAM_REQUIRED")
+        if not self._check_command_exists("mysql"):
+            return self._fail("本机缺少 mysql 客户端，无法远程读库列表", "ERR_NO_MYSQL_CLIENT")
+
+        sys_dbs = {"mysql", "sys", "information_schema", "performance_schema"}
+
+        sql = (
+            "SELECT s.SCHEMA_NAME AS db, "
+            "COALESCE(SUM(t.DATA_LENGTH+t.INDEX_LENGTH)/1024/1024,0) AS size_mb "
+            "FROM information_schema.SCHEMATA s "
+            "LEFT JOIN information_schema.TABLES t ON t.TABLE_SCHEMA=s.SCHEMA_NAME "
+            "GROUP BY s.SCHEMA_NAME ORDER BY size_mb DESC"
+        )
+        r = self._run_shell(
+            ["mysql", "-h", host, "-P", str(port), "-u", user, "-N", "-B", "-e", sql],
+            env_extra={"MYSQL_PWD": pwd},
+            timeout=30,
+        )
+
+        dbs = []
+        if r["code"] == 0:
+            for line in (r.get("stdout") or "").splitlines():
+                if not line.strip():
+                    continue
+                parts = line.split("\t")
+                if not parts:
+                    continue
+                name = parts[0].strip()
+                if not name or name in sys_dbs:
+                    continue
+                try:
+                    size_mb = float(parts[1]) if len(parts) > 1 else 0.0
+                except Exception:
+                    size_mb = 0.0
+                dbs.append({"name": name, "size_mb": round(size_mb, 2)})
+        else:
+            r2 = self._run_shell(
+                ["mysql", "-h", host, "-P", str(port), "-u", user, "-N", "-B", "-e", "SHOW DATABASES"],
+                env_extra={"MYSQL_PWD": pwd},
+                timeout=15,
+            )
+            if r2["code"] != 0:
+                return self._fail(
+                    "读取主库库列表失败: " + (r2.get("stderr") or r.get("stderr") or "").strip()[:200],
+                    "ERR_LIST_DBS",
+                )
+            for line in (r2.get("stdout") or "").splitlines():
+                name = line.strip()
+                if not name or name in sys_dbs:
+                    continue
+                dbs.append({"name": name, "size_mb": 0.0})
+
+        return self._ok({"databases": dbs, "count": len(dbs)}, "主库库列表读取成功", "LIST_DBS_OK")
+
+    def wizard_recommend_bootstrap(self, get=None):
+        """Recommend physical vs logical based on tools + upstream size."""
+        size_mb = 0.0
+        if get is not None and hasattr(get, "size_mb"):
+            try:
+                size_mb = float(get.size_mb)
+            except Exception:
+                size_mb = 0.0
+
+        tools_resp = self.check_bootstrap_tools()
+        tools = tools_resp.get("msg", {}) if isinstance(tools_resp, dict) else {}
+        physical_ready = bool(tools.get("physical_ready"))
+        logical_ready = bool(tools.get("logical_ready"))
+
+        mode = "logical"
+        reason = "默认使用 mysqldump 逻辑通道，兼容性最好"
+        if size_mb >= 20480 and physical_ready:
+            mode = "physical"
+            reason = "数据量 ≥ 20GB 且已安装物理备份工具，建议 physical 加速"
+        elif size_mb >= 2048 and physical_ready:
+            mode = "physical"
+            reason = "数据量 ≥ 2GB 且已安装物理备份工具，建议 physical"
+        elif physical_ready and size_mb >= 512:
+            mode = "auto"
+            reason = "可尝试 auto，由引擎自动选择 physical/logical"
+        if not logical_ready and not physical_ready:
+            mode = "unavailable"
+            reason = "未检测到 mysqldump 与物理工具，请先在高级操作中安装"
+
+        return self._ok(
+            {
+                "recommended_mode": mode,
+                "reason": reason,
+                "size_mb": size_mb,
+                "tools": tools,
+            },
+            "初始化策略已生成",
+            "RECOMMEND_OK",
+        )
+
+    def wizard_start_replication(self, get):
+        """Atomic one-shot: add_source + set_db_mappings + create + trigger.
+
+        Accepts:
+          source_id?, channel_name?, master_host, master_port, repl_user,
+          repl_password, mappings (list of {source_db, target_db} or list of
+          source_db strings; if strings, target_db = `<source_id>_<db>`),
+          mode (auto/physical/logical), auto_start (bool)
+        Returns: {source_id, task_id, worker_id, channel_name, mode}
+        """
+        if get is None:
+            return self._fail("缺少必要参数", "ERR_PARAM_REQUIRED")
+
+        required = ["master_host", "master_port", "repl_user", "repl_password"]
+        for k in required:
+            if not hasattr(get, k) or not str(getattr(get, k)).strip():
+                return self._fail("缺少参数: {}".format(k), "ERR_PARAM_REQUIRED")
+
+        # auto-generate source_id/channel if not supplied
+        data = self._load_config()
+        existing = [s.get("source_id") for s in data.get("sources", [])]
+        source_id = (str(getattr(get, "source_id", "")) or "").strip()
+        if not source_id:
+            idx = 1
+            while True:
+                candidate = "m{}".format(idx)
+                if candidate not in existing:
+                    source_id = candidate
+                    break
+                idx += 1
+        channel_name = (str(getattr(get, "channel_name", "")) or "").strip()
+        if not channel_name:
+            channel_name = "ch_" + re.sub(r"[^A-Za-z0-9_]", "_", source_id)
+
+        if not self._validate_source_id(source_id):
+            return self._fail("source_id 非法", "ERR_PARAM_INVALID")
+        if not self._validate_channel_name(channel_name):
+            return self._fail("channel_name 非法", "ERR_PARAM_INVALID")
+        for s in data.get("sources", []):
+            if s.get("source_id") != source_id and s.get("channel_name") == channel_name:
+                return self._fail("该通道名称已被其他来源占用", "ERR_DUPLICATE")
+
+        # parse mappings (either list of dicts or list of strings)
+        raw_mappings = getattr(get, "mappings", "") or ""
+        if isinstance(raw_mappings, str):
+            try:
+                raw_mappings = json.loads(raw_mappings) if raw_mappings.strip() else []
+            except Exception:
+                return self._fail("mappings 格式非法（需 JSON）", "ERR_PARAM_INVALID")
+        if not isinstance(raw_mappings, list) or not raw_mappings:
+            return self._fail("请至少选择一个要同步的库", "ERR_MAPPINGS_EMPTY")
+
+        normalized = []
+        for m in raw_mappings:
+            if isinstance(m, str):
+                src = m.strip()
+                if not src:
+                    continue
+                tgt = "{}_{}".format(source_id, src)
+            elif isinstance(m, dict):
+                src = str(m.get("source_db", "")).strip()
+                tgt = str(m.get("target_db", "")).strip() or "{}_{}".format(source_id, src)
+            else:
+                return self._fail("mapping 项格式非法", "ERR_PARAM_INVALID")
+            if not src or not tgt:
+                return self._fail("source_db/target_db 不可为空", "ERR_PARAM_INVALID")
+            if not self._validate_mysql_scope_name(src) or not self._validate_mysql_scope_name(tgt):
+                return self._fail("库名只能含字母/数字/下划线/-/$", "ERR_PARAM_INVALID")
+            normalized.append({"source_db": src, "target_db": tgt})
+
+        # create source (idempotent: if exists then update in-place)
+        data = self._load_config()
+        existing_source = self._find_source(data, source_id)
+        source_existed = bool(existing_source)
+        if existing_source:
+            existing_source["master_host"] = str(getattr(get, "master_host")).strip()
+            existing_source["master_port"] = int(getattr(get, "master_port"))
+            existing_source["repl_user"] = str(getattr(get, "repl_user")).strip()
+            existing_source["repl_password"] = self._crypto_encrypt(str(getattr(get, "repl_password")))
+            existing_source["channel_name"] = channel_name
+            existing_source["updated_at"] = self._now()
+            self._append_log(source_id, "检测到重复接入，已更新连接信息并继续流程")
+            self._save_config(data)
+        else:
+            add_payload = public.to_dict_obj({
+                "source_id": source_id,
+                "channel_name": channel_name,
+                "master_host": getattr(get, "master_host"),
+                "master_port": getattr(get, "master_port"),
+                "repl_user": getattr(get, "repl_user"),
+                "repl_password": getattr(get, "repl_password"),
+            })
+            add_resp = self.add_source(add_payload)
+            if not add_resp.get("status"):
+                return add_resp
+
+        # write mappings
+        map_resp = self.set_db_mappings(public.to_dict_obj({
+            "source_id": source_id,
+            "mappings": json.dumps(normalized),
+        }))
+        if not map_resp.get("status"):
+            # rollback best-effort
+            self.remove_source(public.to_dict_obj({"source_id": source_id}))
+            return map_resp
+
+        mode = (str(getattr(get, "mode", "auto")) or "auto").strip().lower()
+        if mode not in ("auto", "physical", "logical"):
+            mode = "auto"
+
+        task_id = None
+        if source_existed:
+            latest_live_task = None
+            current = self._load_config()
+            for t in current.get("bootstrap_tasks", []):
+                if t.get("source_id") == source_id and t.get("status") in ("pending", "running"):
+                    latest_live_task = t
+                    break
+            if latest_live_task:
+                task_id = latest_live_task.get("task_id")
+
+        if not task_id:
+            task_resp = self.create_bootstrap_task(public.to_dict_obj({
+                "source_id": source_id,
+                "mode": mode,
+            }))
+            if not task_resp.get("status"):
+                return task_resp
+            task = task_resp.get("msg", {}) if isinstance(task_resp.get("msg"), dict) else {}
+            task_id = task.get("task_id") if isinstance(task, dict) else None
+
+        auto_start = str(getattr(get, "auto_start", "1")).strip().lower() in ("1", "true", "yes", "on")
+        worker_id = ""
+        if auto_start and task_id:
+            trig = self.trigger_bootstrap_task(public.to_dict_obj({"task_id": task_id}))
+            if trig.get("status"):
+                trig_msg = trig.get("msg", {})
+                if isinstance(trig_msg, dict):
+                    worker_id = trig_msg.get("worker_id", "")
+
+        return self._ok(
+            {
+                "source_id": source_id,
+                "channel_name": channel_name,
+                "task_id": task_id,
+                "worker_id": worker_id,
+                "mode": mode,
+                "mappings_count": len(normalized),
+                "auto_start": auto_start,
+                "source_existed": source_existed,
+            },
+            "检测到重复接入，已更新配置并继续执行任务" if source_existed else ("已完成接入，任务已开始后台执行" if auto_start else "已完成接入，等待手动触发"),
+            "WIZARD_START_OK",
+        )
+
+    def wizard_dashboard_snapshot(self, get=None):
+        """Return per-source status + running tasks with one SHOW SLAVE STATUS."""
+        data = self._load_config()
+        sources = data.get("sources", []) or []
+        tasks = data.get("bootstrap_tasks", []) or []
+
+        status_map = self._all_slave_status()
+        source_rows = []
+        running = 0
+        stopped = 0
+        errors = 0
+        for src in sources:
+            row = status_map.get(src.get("channel_name") or "", None)
+            st = self._map_status_row(row or {})
+            if st["running"]:
+                running += 1
+            else:
+                stopped += 1
+            if st.get("last_error"):
+                errors += 1
+            plain = self._crypto_decrypt(src.get("repl_password", ""))
+            source_rows.append({
+                "source_id": src.get("source_id"),
+                "channel_name": src.get("channel_name"),
+                "master_host": src.get("master_host"),
+                "master_port": src.get("master_port"),
+                "repl_user": src.get("repl_user"),
+                "repl_password_masked": self._mask_secret(plain),
+                "db_mappings": src.get("db_mappings", []),
+                "status": st,
+                "updated_at": src.get("updated_at"),
+            })
+
+        live_tasks = []
+        for t in tasks[:50]:
+            if t.get("status") in ("pending", "running"):
+                live_tasks.append({
+                    "task_id": t.get("task_id"),
+                    "source_id": t.get("source_id"),
+                    "mode": t.get("mode"),
+                    "effective_mode": t.get("effective_mode"),
+                    "status": t.get("status"),
+                    "current_step": t.get("current_step"),
+                    "progress": t.get("progress"),
+                    "retry_count": t.get("retry_count"),
+                    "error": t.get("error"),
+                    "error_type": t.get("error_type"),
+                    "started_at": t.get("started_at"),
+                    "last_heartbeat": t.get("last_heartbeat"),
+                })
+
+        done_tasks = [t for t in tasks if t.get("status") == "done"]
+        avg_duration = 0
+        if done_tasks:
+            avg_duration = int(sum(int(t.get("duration_seconds", 0) or 0) for t in done_tasks) / len(done_tasks))
+
+        return self._ok(
+            {
+                "sources": source_rows,
+                "live_tasks": live_tasks,
+                "metrics": {
+                    "total_sources": len(sources),
+                    "running_sources": running,
+                    "stopped_sources": stopped,
+                    "error_sources": errors,
+                    "bootstrap_tasks": len(tasks),
+                    "bootstrap_done": len(done_tasks),
+                    "bootstrap_failed": len([t for t in tasks if t.get("status") == "failed"]),
+                    "avg_bootstrap_duration_seconds": avg_duration,
+                },
+                "mode": data.get("mode", "replica_mode"),
+                "generated_at": self._now(),
+            },
+            "仪表盘快照已生成",
+            "DASHBOARD_OK",
+        )
+
+    def wizard_diagnose_all(self, get=None):
+        """Classify issues across sources and tasks into actionable groups."""
+        data = self._load_config()
+        groups = {
+            "network": [], "auth": [], "gtid": [],
+            "conflict": [], "resource": [], "config": [], "other": [],
+        }
+
+        def bucket(kind_cn):
+            m = {
+                "网络问题": "network", "网络超时": "network", "端口拒绝": "network", "路由不可达": "network",
+                "权限问题": "auth", "账号或权限错误": "auth",
+                "GTID问题": "gtid",
+                "数据冲突": "conflict",
+                "资源不足": "resource",
+                "未知连接错误": "network",
+                "未知问题": "other",
+            }
+            return m.get(kind_cn, "other")
+
+        status_map = self._all_slave_status()
+        for src in data.get("sources", []) or []:
+            row = status_map.get(src.get("channel_name") or "", None)
+            st = self._map_status_row(row or {})
+            if st.get("last_error"):
+                kind = self._classify_error(st["last_error"])
+                groups[bucket(kind)].append({
+                    "source_id": src.get("source_id"),
+                    "channel_name": src.get("channel_name"),
+                    "message": st["last_error"],
+                    "category": kind,
+                    "fixable": kind in ("网络问题", "权限问题", "GTID问题"),
+                })
+
+        for t in (data.get("bootstrap_tasks", []) or [])[:50]:
+            if t.get("status") == "failed" and t.get("error"):
+                kind = t.get("error_type") or self._classify_error(t.get("error"))
+                groups[bucket(kind)].append({
+                    "task_id": t.get("task_id"),
+                    "source_id": t.get("source_id"),
+                    "message": t.get("error"),
+                    "category": kind,
+                    "fixable": kind in ("权限问题", "资源不足", "网络问题"),
+                })
+
+        # master health issues → config group
+        try:
+            mh = self.master_health_check().get("msg", {})
+            for item in mh.get("items", []):
+                if item.get("status") == "fail":
+                    groups["config"].append({
+                        "name": item.get("name"),
+                        "current": item.get("current"),
+                        "expected": item.get("expected"),
+                        "message": item.get("suggestion"),
+                        "category": "配置",
+                        "fixable": True,
+                    })
+        except Exception:
+            pass
+
+        total = sum(len(v) for v in groups.values())
+        return self._ok(
+            {"groups": groups, "total_issues": total},
+            "诊断完成",
+            "DIAGNOSE_OK",
+        )
+
+    def wizard_quick_fix(self, get):
+        """Best-effort one-click fix for selected category."""
+        if not hasattr(get, "category"):
+            return self._fail("缺少参数: category", "ERR_PARAM_REQUIRED")
+        cat = str(get.category).strip().lower()
+        if cat in ("config", "gtid"):
+            return self.master_auto_fix_apply(get)
+        if cat == "stuck_tasks" or cat == "task":
+            return self.recover_bootstrap_tasks()
+        if cat in ("network", "auth"):
+            return self._ok(
+                {"hint": "网络/账号问题需检查云安全组、主库防火墙与复制账号 user@host 限制。"},
+                "已输出自助排查指引",
+                "FIX_HINT",
+            )
+        return self._fail("不支持的修复类别: {}".format(cat), "ERR_UNKNOWN_CATEGORY")

@@ -173,3 +173,43 @@
   - 专家模式可随时查看完整能力
 - 身份与路径联动：
   - 主机/从机身份推荐继续保留，并映射到更合适的向导起点
+
+## 阶段二十一：v2.0 全面重构（已完成）
+
+### 后端
+
+- **安全修复**：
+  - 复制密码全部加密存储（Fernet AES / XOR 回退），旧明文自动迁移
+  - shell 命令不再嵌入密码字符串，改用 `subprocess.Popen` + `MYSQL_PWD` 环境变量
+  - `_validate_privileges_text` 正则 bug 修复（`\\s` → `\s`）
+  - 新增 `_with_lock` 文件锁保护 `_load_config/_save_config`
+  - 所有 API 返回统一为 `_ok/_fail` 结构化格式
+- **物理初始化真实落地**：
+  - `_run_physical_bootstrap` 改为 SSH + xtrabackup stream 真实流水线
+  - 缺少工具/SSH 不通时自动降级 logical，带完整审计日志
+- **任务调度真恢复**：
+  - `recover_bootstrap_tasks` 恢复后自动触发 `trigger_bootstrap_task`
+  - 新增 `tick` 方法供 cron 定时巡检
+- **向导编排层**（8 个新接口）：
+  - `wizard_detect_env` / `wizard_preflight_source` / `wizard_list_master_dbs`
+  - `wizard_recommend_bootstrap` / `wizard_start_replication`（原子）
+  - `wizard_dashboard_snapshot`（消除 N+1 查询）
+  - `wizard_diagnose_all` / `wizard_quick_fix`
+
+### 前端
+
+- **Vue3 + Vite 重写**：
+  - 全新 `frontend/` 工程，使用 `vite-plugin-singlefile` 产出内联单 HTML
+  - 集成 Naive UI 组件库、Pinia 状态管理
+  - 宝塔安装方式零变化
+- **首屏四卡片**：环境自动识别 → 推荐任务卡
+- **主库向导 4 步**：体检 → 修复预览 → 一键修复 → 导出配置单
+- **从库向导 5 步**：粘贴/手填 → 三维连通性 → 库 checkbox 选器 → 策略推荐 → 一键同步
+- **仪表盘**：卡片化来源 + 健康灯 + 5s 轮询 + 任务进度条
+- **诊断中心**：按类分组 + 一键修复 + 手工指引
+- **专家视图**：保留旧 4 页签与全部原始按钮
+
+### 文档
+
+- 重写 `docs/傻瓜式快速上手.md`、`docs/用户使用手册.md`
+- 新增 `docs/前端开发指南.md`

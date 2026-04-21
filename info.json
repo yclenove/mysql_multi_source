@@ -2,7 +2,7 @@
   "title": "MySQL Multi Source Replication",
   "name": "mysql_multi_source",
   "ps": "Single replica instance with multiple upstream MySQL sources",
-  "versions": "0.1.0",
+  "versions": "2.0.0",
   "checks": "/www/server/panel/plugin/mysql_multi_source",
   "author": "逆蝶",
   "home": "https://github.com/yclenove/mysql_multi_source",
