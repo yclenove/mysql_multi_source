@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, reactive, onMounted, computed, watch, nextTick } from 'vue'
+import { ref, reactive, onMounted, onBeforeUnmount, computed, watch, nextTick } from 'vue'
 import {
   NSteps, NStep, NButton, NSpace, NInput, NInputNumber, NCheckbox, NAlert,
   NIcon, useMessage, NSpin, NResult, NSelect,
@@ -188,6 +188,75 @@ function statusIcon(s: string): string {
   return s === 'ok' ? '✓' : s === 'warn' ? '!' : '✗'
 }
 
+// ---------- Physical mode: install xtrabackup / mariabackup on master ----------
+const masterTools = reactive({
+  checked: false,
+  checking: false,
+  is_root: false,
+  os_family: '',
+  xtrabackup: false,
+  mariabackup: false,
+  mysqldump: false,
+  mysql: false,
+})
+const masterToolInstalling = ref('') // '' | 'xtrabackup' | 'mariabackup'
+const masterToolLog = ref('')
+let masterToolLogTimer: any = null
+
+async function refreshMasterTools() {
+  masterTools.checking = true
+  const res = await call('check_bootstrap_tools')
+  masterTools.checking = false
+  masterTools.checked = true
+  if (isOk(res)) {
+    const d = extractMsg(res) || {}
+    masterTools.is_root = !!d.is_root
+    masterTools.os_family = d.os_family || ''
+    masterTools.xtrabackup = !!d.xtrabackup
+    masterTools.mariabackup = !!d.mariabackup
+    masterTools.mysqldump = !!d.mysqldump
+    masterTools.mysql = !!d.mysql
+  }
+}
+
+function stopMasterToolLogPolling() {
+  if (masterToolLogTimer) {
+    clearInterval(masterToolLogTimer)
+    masterToolLogTimer = null
+  }
+}
+
+async function pollMasterToolLog() {
+  const res = await call('get_tool_install_log')
+  if (isOk(res)) {
+    const d = extractMsg(res) || {}
+    masterToolLog.value = d.content || ''
+  }
+}
+
+async function installMasterTool(toolName: 'xtrabackup' | 'mariabackup') {
+  if (masterToolInstalling.value) return
+  if (!masterTools.is_root) {
+    msg.warning('需要 root 权限才能自动安装，请在宝塔面板用 root 登录后重试')
+    return
+  }
+  masterToolInstalling.value = toolName
+  masterToolLog.value = `[前端] 开始安装 ${toolName}，请稍候（首次安装 1~5 分钟）…\n`
+  stopMasterToolLogPolling()
+  masterToolLogTimer = setInterval(pollMasterToolLog, 2000)
+  const res = await call('install_bootstrap_tool', { tool_name: toolName })
+  stopMasterToolLogPolling()
+  await pollMasterToolLog()
+  masterToolInstalling.value = ''
+  if (isOk(res)) {
+    msg.success(`${toolName} 安装成功，物理模式可在此主库上使用了`)
+  } else {
+    const errMsg = getMessage(res) || '安装失败，请查看下方日志'
+    msg.error(errMsg)
+  }
+  await refreshMasterTools()
+}
+
 // ---------- Physical mode: install replica SSH handshake / pubkey ----------
 const replicaPubKey = ref('')
 const pubKeyInstalling = ref(false)
@@ -223,6 +292,11 @@ onMounted(() => {
     viewMode.value = 'wizard'
     runHealthCheck()
   }
+  refreshMasterTools()
+})
+
+onBeforeUnmount(() => {
+  stopMasterToolLogPolling()
 })
 </script>
 
@@ -293,6 +367,65 @@ onMounted(() => {
             <code>{{ env.masterSetup.repl_user }}</code>
           </div>
           <p class="mms-info-hint">如需给从库发送配置单，点击下方"导出配置单"</p>
+        </div>
+      </div>
+
+      <!-- Physical-mode tools card: install xtrabackup/mariabackup on master. -->
+      <div class="mms-step-card" style="margin-top:16px">
+        <div class="mms-step-card__header">
+          <h3>物理模式 · 安装 xtrabackup（主库侧）</h3>
+          <NButton size="small" :loading="masterTools.checking" @click="refreshMasterTools">
+            <template #icon><NIcon :component="RefreshOutline" :size="14" /></template>
+            重新检测
+          </NButton>
+        </div>
+        <NAlert type="info" :bordered="false" style="margin-bottom:10px">
+          "物理 (xtrabackup)"模式要求<b>主库也安装 xtrabackup / mariabackup</b>，否则从库会自动降级为逻辑模式。
+          如果只用默认的逻辑 (mysqldump) 模式，这里可以忽略。
+        </NAlert>
+        <div class="mms-tool-grid">
+          <div class="mms-tool-row">
+            <div>
+              <b>xtrabackup</b>
+              <span class="mms-tool-tag" :class="masterTools.xtrabackup ? 'ok' : 'miss'">
+                {{ masterTools.xtrabackup ? '已安装' : '未安装' }}
+              </span>
+            </div>
+            <NButton
+              size="small" type="primary" ghost
+              :disabled="masterTools.xtrabackup || !masterTools.is_root || !!masterToolInstalling"
+              :loading="masterToolInstalling === 'xtrabackup'"
+              @click="installMasterTool('xtrabackup')"
+            >
+              {{ masterTools.xtrabackup ? '已就绪' : (masterToolInstalling === 'xtrabackup' ? '安装中…' : '一键安装 xtrabackup') }}
+            </NButton>
+          </div>
+          <div class="mms-tool-row">
+            <div>
+              <b>mariabackup</b>
+              <span class="mms-tool-tag" :class="masterTools.mariabackup ? 'ok' : 'miss'">
+                {{ masterTools.mariabackup ? '已安装' : '未安装' }}
+              </span>
+              <span style="color:#999; font-size:12px; margin-left:6px">（MariaDB 可选替代）</span>
+            </div>
+            <NButton
+              size="small" ghost
+              :disabled="masterTools.mariabackup || !masterTools.is_root || !!masterToolInstalling"
+              :loading="masterToolInstalling === 'mariabackup'"
+              @click="installMasterTool('mariabackup')"
+            >
+              {{ masterTools.mariabackup ? '已就绪' : (masterToolInstalling === 'mariabackup' ? '安装中…' : '一键安装 mariabackup') }}
+            </NButton>
+          </div>
+        </div>
+        <NAlert v-if="!masterTools.is_root && masterTools.checked" type="warning" :bordered="false" style="margin-top:10px">
+          当前进程非 root，无法自动安装系统软件包。请用 root 打开宝塔面板，或手动在服务器上执行：
+          <code>apt-get install percona-xtrabackup-80</code> / <code>yum install percona-xtrabackup-80</code>
+        </NAlert>
+        <div v-if="masterToolLog" class="mms-tool-log">
+          <div class="mms-tool-log__label">实时安装日志（最近 200 行）：</div>
+          <NInput type="textarea" :value="masterToolLog" :rows="8" readonly
+                  style="font-family: ui-monospace,Menlo,monospace; font-size:12px" />
         </div>
       </div>
 
@@ -569,6 +702,62 @@ onMounted(() => {
         </template>
       </NResult>
 
+      <!-- Physical-mode tools card in wizard step 4 (same logic as summary view). -->
+      <div class="mms-step-card" style="margin-top:16px">
+        <div class="mms-step-card__header">
+          <h3>物理模式 · 安装 xtrabackup（主库侧，可选）</h3>
+          <NButton size="small" :loading="masterTools.checking" @click="refreshMasterTools">
+            <template #icon><NIcon :component="RefreshOutline" :size="14" /></template>
+            重新检测
+          </NButton>
+        </div>
+        <NAlert type="info" :bordered="false" style="margin-bottom:10px">
+          仅当从库打算用"物理 (xtrabackup)"模式（大库更快）时需要；普通逻辑同步可以跳过。
+        </NAlert>
+        <div class="mms-tool-grid">
+          <div class="mms-tool-row">
+            <div>
+              <b>xtrabackup</b>
+              <span class="mms-tool-tag" :class="masterTools.xtrabackup ? 'ok' : 'miss'">
+                {{ masterTools.xtrabackup ? '已安装' : '未安装' }}
+              </span>
+            </div>
+            <NButton
+              size="small" type="primary" ghost
+              :disabled="masterTools.xtrabackup || !masterTools.is_root || !!masterToolInstalling"
+              :loading="masterToolInstalling === 'xtrabackup'"
+              @click="installMasterTool('xtrabackup')"
+            >
+              {{ masterTools.xtrabackup ? '已就绪' : (masterToolInstalling === 'xtrabackup' ? '安装中…' : '一键安装 xtrabackup') }}
+            </NButton>
+          </div>
+          <div class="mms-tool-row">
+            <div>
+              <b>mariabackup</b>
+              <span class="mms-tool-tag" :class="masterTools.mariabackup ? 'ok' : 'miss'">
+                {{ masterTools.mariabackup ? '已安装' : '未安装' }}
+              </span>
+            </div>
+            <NButton
+              size="small" ghost
+              :disabled="masterTools.mariabackup || !masterTools.is_root || !!masterToolInstalling"
+              :loading="masterToolInstalling === 'mariabackup'"
+              @click="installMasterTool('mariabackup')"
+            >
+              {{ masterTools.mariabackup ? '已就绪' : (masterToolInstalling === 'mariabackup' ? '安装中…' : '一键安装 mariabackup') }}
+            </NButton>
+          </div>
+        </div>
+        <NAlert v-if="!masterTools.is_root && masterTools.checked" type="warning" :bordered="false" style="margin-top:10px">
+          当前进程非 root，无法自动安装。请用 root 打开宝塔面板后重试。
+        </NAlert>
+        <div v-if="masterToolLog" class="mms-tool-log">
+          <div class="mms-tool-log__label">实时安装日志：</div>
+          <NInput type="textarea" :value="masterToolLog" :rows="6" readonly
+                  style="font-family: ui-monospace,Menlo,monospace; font-size:12px" />
+        </div>
+      </div>
+
       <!-- Physical-mode handshake card (also shown in wizard step 4 so the
            user never has to hunt for it). -->
       <div class="mms-step-card" style="margin-top:16px">
@@ -703,6 +892,36 @@ onMounted(() => {
 }
 .mms-check-item__expect {
   color: #d03050;
+}
+.mms-tool-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.mms-tool-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  background: #fafafa;
+  border-radius: 8px;
+}
+.mms-tool-row b { font-size: 14px; color: #333; margin-right: 8px; }
+.mms-tool-tag {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.mms-tool-tag.ok { background: #e8f7ef; color: #18a058; }
+.mms-tool-tag.miss { background: #fdecec; color: #d03050; }
+.mms-tool-log { margin-top: 12px; }
+.mms-tool-log__label {
+  font-size: 12px;
+  color: #666;
+  margin-bottom: 4px;
 }
 .mms-summary-bar {
   display: flex;

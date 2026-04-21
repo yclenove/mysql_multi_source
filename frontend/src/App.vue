@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { onMounted, watch, nextTick } from 'vue'
-import { NConfigProvider, NMessageProvider, NDialogProvider, zhCN, dateZhCN, type GlobalThemeOverrides } from 'naive-ui'
+import { onMounted, onBeforeUnmount, ref, watch, nextTick } from 'vue'
+import { NConfigProvider, NMessageProvider, NDialogProvider, NButton, NIcon, zhCN, dateZhCN, type GlobalThemeOverrides } from 'naive-ui'
+import { ChevronUpOutline, ChevronDownOutline } from '@vicons/ionicons5'
 import { useEnvStore } from '@/store/env'
 import LandingCards from '@/components/LandingCards.vue'
 import WizardMaster from '@/views/WizardMaster.vue'
@@ -12,15 +13,136 @@ import AppHeader from '@/components/AppHeader.vue'
 import { scrollPluginTop } from '@/utils/scroll'
 
 const env = useEnvStore()
+
+// --- Scroll helpers: find the actual scroll container (BaoTa wraps the
+// plugin inside several scrollable ancestors: .soft-Body / .plugin_body /
+// .layui-layer-content). We locate the one that's actually scrolling and
+// track its scroll position so we can show a draggable floating indicator.
+const showFabs = ref(false)
+const scrollPct = ref(0)
+let scrollTarget: HTMLElement | null = null
+let scrollListener: (() => void) | null = null
+
+function findScrollContainer(): HTMLElement | null {
+  const candidates = [
+    document.querySelector('.mms-app'),
+    document.scrollingElement as HTMLElement | null,
+    document.body,
+  ].filter(Boolean) as HTMLElement[]
+  // Walk from .mms-app up to find the first ancestor whose scrollHeight > clientHeight.
+  let el: HTMLElement | null = document.querySelector('.mms-app') as HTMLElement | null
+  while (el) {
+    const style = getComputedStyle(el)
+    const oy = style.overflowY
+    if ((oy === 'auto' || oy === 'scroll') && el.scrollHeight - el.clientHeight > 10) {
+      return el
+    }
+    el = el.parentElement
+  }
+  // Try parent window (BaoTa iframe layer wrappers)
+  try {
+    const pw = window.parent
+    if (pw && pw !== window) {
+      const layerContent = pw.document.querySelector('.layui-layer-content, .plugin_body, .soft-Body') as HTMLElement | null
+      if (layerContent && layerContent.scrollHeight - layerContent.clientHeight > 10) return layerContent
+    }
+  } catch { /* cross-origin, ignore */ }
+  // Fallback to candidates
+  for (const c of candidates) {
+    if (c && c.scrollHeight - c.clientHeight > 10) return c
+  }
+  return null
+}
+
+function updateScrollPct() {
+  if (!scrollTarget) return
+  const max = scrollTarget.scrollHeight - scrollTarget.clientHeight
+  if (max <= 0) {
+    scrollPct.value = 0
+    showFabs.value = false
+    return
+  }
+  scrollPct.value = Math.min(100, Math.max(0, Math.round((scrollTarget.scrollTop / max) * 100)))
+  showFabs.value = scrollTarget.scrollHeight > scrollTarget.clientHeight + 80
+}
+
+function attachScroll() {
+  detachScroll()
+  scrollTarget = findScrollContainer()
+  if (!scrollTarget) return
+  scrollListener = () => updateScrollPct()
+  scrollTarget.addEventListener('scroll', scrollListener, { passive: true })
+  updateScrollPct()
+}
+
+function detachScroll() {
+  if (scrollTarget && scrollListener) {
+    scrollTarget.removeEventListener('scroll', scrollListener)
+  }
+  scrollTarget = null
+  scrollListener = null
+}
+
+function scrollToTop() {
+  if (!scrollTarget) attachScroll()
+  scrollTarget?.scrollTo({ top: 0, behavior: 'smooth' })
+}
+
+function scrollToBottom() {
+  if (!scrollTarget) attachScroll()
+  if (!scrollTarget) return
+  scrollTarget.scrollTo({ top: scrollTarget.scrollHeight, behavior: 'smooth' })
+}
+
+function jumpToTrack(evt: MouseEvent) {
+  if (!scrollTarget) attachScroll()
+  if (!scrollTarget) return
+  const track = evt.currentTarget as HTMLElement
+  const rect = track.getBoundingClientRect()
+  const ratio = Math.min(1, Math.max(0, (evt.clientY - rect.top) / rect.height))
+  const max = scrollTarget.scrollHeight - scrollTarget.clientHeight
+  scrollTarget.scrollTo({ top: max * ratio, behavior: 'smooth' })
+}
+
+function dragTrack(evt: MouseEvent) {
+  if (!scrollTarget) attachScroll()
+  if (!scrollTarget) return
+  const track = evt.currentTarget as HTMLElement
+  const rect = track.getBoundingClientRect()
+  const max = scrollTarget.scrollHeight - scrollTarget.clientHeight
+  const onMove = (e: MouseEvent) => {
+    const ratio = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height))
+    scrollTarget!.scrollTop = max * ratio
+  }
+  const onUp = () => {
+    window.removeEventListener('mousemove', onMove)
+    window.removeEventListener('mouseup', onUp)
+  }
+  window.addEventListener('mousemove', onMove)
+  window.addEventListener('mouseup', onUp)
+  evt.preventDefault()
+}
+
 onMounted(() => {
   env.detectEnv()
   scrollPluginTop()
+  nextTick(() => setTimeout(attachScroll, 200))
+})
+
+onBeforeUnmount(() => {
+  detachScroll()
 })
 
 watch(
   () => env.currentView,
   () => {
-    nextTick(() => scrollPluginTop())
+    nextTick(() => {
+      scrollPluginTop()
+      setTimeout(() => {
+        attachScroll()
+        updateScrollPct()
+      }, 200)
+    })
   },
 )
 
@@ -66,6 +188,25 @@ const themeOverrides: GlobalThemeOverrides = {
             <DiagnoseView v-else-if="env.currentView === 'diagnose'" />
             <ExpertLayout v-else-if="env.currentView === 'expert'" />
           </div>
+
+          <!-- Floating scroll helper (right edge). Visible only when the
+               page content actually overflows. -->
+          <div v-if="showFabs" class="mms-scroll-fab" @mouseenter="updateScrollPct">
+            <NButton circle size="small" type="primary" ghost @click="scrollToTop" title="回到顶部">
+              <template #icon><NIcon :component="ChevronUpOutline" /></template>
+            </NButton>
+            <div
+              class="mms-scroll-fab__track"
+              :title="`滚动进度 ${scrollPct}%（点击跳转 / 按住拖动）`"
+              @click="jumpToTrack"
+              @mousedown="dragTrack"
+            >
+              <div class="mms-scroll-fab__thumb" :style="{ height: Math.max(12, scrollPct) + '%' }"></div>
+            </div>
+            <NButton circle size="small" type="primary" ghost @click="scrollToBottom" title="跳到底部">
+              <template #icon><NIcon :component="ChevronDownOutline" /></template>
+            </NButton>
+          </div>
         </div>
       </NDialogProvider>
     </NMessageProvider>
@@ -81,9 +222,77 @@ const themeOverrides: GlobalThemeOverrides = {
   max-width: 1100px;
   margin: 0 auto;
   padding: 0 20px;
+  position: relative;
 }
 .mms-body {
   padding-top: 16px;
   padding-bottom: 24px;
+}
+
+/* Force a visible, draggable scrollbar for WebKit browsers. BaoTa's modal
+   container often renders a near-invisible native scrollbar that users
+   can't see or drag; this makes it discoverable. */
+body,
+.mms-app,
+.mms-body,
+html,
+.layui-layer-content,
+.plugin_body,
+.soft-Body {
+  scrollbar-width: thin;
+  scrollbar-color: #c5c8d0 transparent;
+}
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #c5c8d0;
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  min-height: 40px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #8a8f9d;
+  background-clip: padding-box;
+  border: 2px solid transparent;
+}
+
+/* Floating up / down / progress indicator on the right edge */
+.mms-scroll-fab {
+  position: fixed;
+  right: 16px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 6px;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 20px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.1);
+  backdrop-filter: blur(6px);
+}
+.mms-scroll-fab__track {
+  width: 4px;
+  height: 120px;
+  background: #eef0f4;
+  border-radius: 2px;
+  overflow: hidden;
+  margin: 4px 0;
+  cursor: pointer;
+}
+.mms-scroll-fab__thumb {
+  width: 100%;
+  background: linear-gradient(180deg, #4098fc 0%, #2080f0 100%);
+  border-radius: 2px;
+  transition: height 0.15s ease;
 }
 </style>

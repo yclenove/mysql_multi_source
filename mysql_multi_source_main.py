@@ -694,7 +694,11 @@ class mysql_multi_source_main:
         if preflight["code"] != 0 or "NO_TOOL" in preflight.get("stdout", ""):
             err_txt = (preflight.get("stderr") or "") + (preflight.get("stdout") or "")
             if "NO_TOOL" in (preflight.get("stdout") or ""):
-                friendly = "主库服务器未安装 {}，自动改用 logical 模式".format(tool)
+                friendly = (
+                    "主库服务器未安装 {tool}（物理模式需要在主库上执行 {tool} --backup），"
+                    "自动改用 logical 模式。"
+                    "如需物理模式：去主库插件「帮我成为主库 → 物理模式 · 安装 xtrabackup」一键安装。"
+                ).format(tool=tool)
             elif "permission denied" in err_txt.lower() or "publickey" in err_txt.lower():
                 friendly = "主库未配置 SSH 免密到从库，物理模式不可用，自动改用 logical（这是正常流程，不是故障）"
             elif "timed out" in err_txt.lower() or "connection refused" in err_txt.lower() or preflight["code"] == 255:
