@@ -150,6 +150,47 @@
     background: #fef2f2;
     color: #991b1b;
   }
+  .mms-root .mms-rolebar {
+    border: 1px solid #dbeafe;
+    background: #eff6ff;
+    color: #1e3a8a;
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 12px;
+  }
+  .mms-root .mms-rolebar .mms-rolebar-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .mms-root .mms-identity-guide {
+    border: 1px solid #bfdbfe;
+    background: #f8fbff;
+    border-radius: 8px;
+    padding: 14px;
+    margin-bottom: 12px;
+  }
+  .mms-root .mms-steps {
+    border: 1px solid #e6e8eb;
+    border-radius: 8px;
+    background: #fff;
+    padding: 10px 12px;
+    margin-bottom: 12px;
+    font-size: 12px;
+    color: #475569;
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .mms-root .mms-step-link {
+    cursor: pointer;
+    color: #2563eb;
+  }
   .mms-root .mms-tab-pane[hidden],
   .mms-root .mms-tab-pane.is-hidden {
     display: none !important;
@@ -170,14 +211,41 @@
 
 <div class="bt-w-main">
   <div class="bt-w-menu">
-    <p class="bgw on" data-mms-tab="0" title="从库日常：快捷操作与来源列表">工作台</p>
-    <p class="bgw" data-mms-tab="1" title="新来源、连通性、库映射">来源与映射</p>
-    <p class="bgw" data-mms-tab="2" title="初始化、物理工具、压测">初始化与工具</p>
-    <p class="bgw" data-mms-tab="3" title="主库本机运维与协同">主库与协同</p>
+    <p class="bgw on" data-mms-tab="1" title="接入主库来源、连接校验、配置映射">快速接入</p>
+    <p class="bgw" data-mms-tab="2" title="创建并执行初始化任务">初始化任务</p>
+    <p class="bgw" data-mms-tab="0" title="从库日常监控和来源状态">运行监控</p>
+    <p class="bgw" data-mms-tab="3" title="主库本机检测、修复、协同配置">主库运维</p>
   </div>
   <div class="bt-w-con pd15 mms-root plugin_body">
     <div id="mms_result_panel" class="mms-result-panel"></div>
-    <!-- 工作台：从库日常 -->
+    <div class="mms-rolebar">
+      <div id="mms_rolebar_text">当前身份：未确认</div>
+      <div class="mms-rolebar-actions">
+        <button class="btn btn-default btn-xs" id="btn-switch-replica">切到从机视角</button>
+        <button class="btn btn-default btn-xs" id="btn-switch-master">切到主机视角</button>
+        <button class="btn btn-default btn-xs" id="btn-redetect-role">重新自动检测</button>
+      </div>
+    </div>
+    <div id="mms_identity_guide" class="mms-identity-guide is-hidden">
+      <div style="font-size:15px;font-weight:600;color:#1e293b;margin-bottom:6px;">先确认你的操作身份</div>
+      <div id="mms_identity_hint" class="mms-card-desc">正在检测当前机器更适合主机还是从机操作...</div>
+      <div class="mms-toolbar" style="margin-top:10px;">
+        <button class="btn btn-success btn-sm" id="btn-accept-role">按推荐进入</button>
+        <button class="btn btn-default btn-sm" id="btn-skip-role">先跳过</button>
+        <button class="btn btn-default btn-sm" id="btn-force-replica">我是从机</button>
+        <button class="btn btn-default btn-sm" id="btn-force-master">我是主机</button>
+      </div>
+    </div>
+    <div class="mms-steps">
+      <span class="mms-step-link" data-jump-tab="1">1. 快速接入来源</span>
+      <span>-></span>
+      <span class="mms-step-link" data-jump-tab="1">2. 保存库映射</span>
+      <span>-></span>
+      <span class="mms-step-link" data-jump-tab="2">3. 创建并执行任务</span>
+      <span>-></span>
+      <span class="mms-step-link" data-jump-tab="0">4. 运行监控</span>
+    </div>
+    <!-- 快速接入 -->
     <div class="mms-tab-pane" data-mms-tab="0">
       <div class="mms-card">
         <div class="mms-card-head">
@@ -216,7 +284,7 @@
       </div>
     </div>
 
-    <!-- 来源与映射 -->
+    <!-- 初始化任务 -->
     <div class="mms-tab-pane is-hidden" data-mms-tab="1">
       <div class="mms-card">
         <div class="mms-card-head">
@@ -275,7 +343,7 @@
       </div>
     </div>
 
-    <!-- 初始化与工具 -->
+    <!-- 运行监控 -->
     <div class="mms-tab-pane is-hidden" data-mms-tab="2">
       <div class="mms-card">
         <div class="mms-card-head">
@@ -300,6 +368,9 @@
           <div class="mms-field"><span class="mms-label">&nbsp;</span><button class="btn btn-default btn-sm" id="btn-list-boot">任务列表</button></div>
         </div>
       </div>
+      <details class="mms-details">
+        <summary>高级操作：工具安装与压测（可选）</summary>
+        <div class="mms-details-body">
       <div class="mms-card">
         <div class="mms-card-head">
           <h3>物理工具安装助手</h3>
@@ -333,9 +404,11 @@
           <button class="btn btn-default btn-sm" id="btn-stress-report">压测报告</button>
         </div>
       </div>
+      </div>
+      </details>
     </div>
 
-    <!-- 主库与协同 -->
+    <!-- 主库运维 -->
     <div class="mms-tab-pane is-hidden" data-mms-tab="3">
       <div class="mms-banner">以下「主库检测 / 修复 / 重启」等仅在<strong>当前宝塔所在机器</strong>的 MySQL 上生效。请先在<strong>主库服务器</strong>打开本插件再操作。连接性测试请在「来源与映射」页。</div>
       <div class="mms-card" style="border:1px dashed #cbd5e1;">
@@ -404,7 +477,20 @@
   (function () {
     var state = {
       pending: {},
-      latestReq: {}
+      latestReq: {},
+      activeMode: 'unknown',
+      suggestedMode: 'replica_mode',
+      guideVisible: true
+    };
+    var identityModeLabels = {
+      master_mode: '主机视角',
+      replica_mode: '从机视角',
+      unknown: '未确认'
+    };
+    var menuVisibleMap = {
+      master_mode: [3, 0],
+      replica_mode: [1, 2, 0],
+      unknown: [1, 0]
     };
 
     function esc(value) {
@@ -504,9 +590,19 @@
       });
     }
 
-    function mmsSetTab(index) {
+    function getVisibleTabs() {
+      return menuVisibleMap[state.activeMode] || menuVisibleMap.unknown;
+    }
+
+    function sanitizeTab(index) {
       var n = parseInt(index, 10);
-      if (isNaN(n) || n < 0 || n > 3) n = 0;
+      var visible = getVisibleTabs();
+      if (isNaN(n) || visible.indexOf(n) === -1) n = visible[0];
+      return n;
+    }
+
+    function mmsSetTab(index) {
+      var n = sanitizeTab(index);
       $('.bt-w-main .bt-w-menu .bgw').removeClass('on active');
       $('.bt-w-main .bt-w-menu .bgw[data-mms-tab="' + n + '"]').addClass('on');
       $('.mms-tab-pane').each(function () {
@@ -522,20 +618,95 @@
       } catch (e) {}
     }
 
-    function mmsInitTab() {
+    function applyMenuByMode(mode) {
+      state.activeMode = mode || 'unknown';
+      var visible = getVisibleTabs();
+      $('.bt-w-main .bt-w-menu .bgw').each(function () {
+        var idx = parseInt($(this).attr('data-mms-tab'), 10);
+        $(this).toggle(visible.indexOf(idx) !== -1);
+      });
       var saved = null;
       try {
         saved = sessionStorage.getItem('mms_active_tab');
       } catch (e) {}
-      if (saved !== null && saved !== '' && !isNaN(parseInt(saved, 10))) {
-        mmsSetTab(saved);
+      mmsSetTab(saved == null ? visible[0] : saved);
+      $('#mms_rolebar_text').text('当前身份：' + (identityModeLabels[state.activeMode] || '未确认'));
+    }
+
+    function showIdentityGuide(show, hint) {
+      state.guideVisible = !!show;
+      if (hint) $('#mms_identity_hint').text(hint);
+      $('#mms_identity_guide').toggleClass('is-hidden', !state.guideVisible);
+    }
+
+    function updateRoleGuard() {
+      var mode = state.activeMode;
+      var tips = [];
+      if (mode === 'master_mode') {
+        tips.push('你现在是主机视角：重点使用「主库运维」。');
+      } else if (mode === 'replica_mode') {
+        tips.push('你现在是从机视角：请先「快速接入」再执行初始化任务。');
       } else {
-        mmsSetTab(0);
+        tips.push('身份未确认：建议先选择主机/从机身份。');
       }
+      showResult(tips.join('\n'), false);
+    }
+
+    function detectAndSuggestRole(cb) {
+      api('detect_running_mode', {}, { singleFlight: true }, function (res) {
+        if (!res.status) {
+          showIdentityGuide(true, '自动检测失败，请手动选择身份。');
+          if (cb) cb('unknown');
+          return;
+        }
+        var msg = res.msg || {};
+        state.suggestedMode = msg.suggested_mode || 'replica_mode';
+        var confidence = msg.confidence || 0;
+        var hint = '检测建议：' + (identityModeLabels[state.suggestedMode] || state.suggestedMode) +
+          '（置信度 ' + confidence + '%）。你可以直接采用、跳过，或手动切换。';
+        showIdentityGuide(true, hint);
+        if (cb) cb(state.suggestedMode);
+      });
+    }
+
+    function setMode(mode, sourceText) {
+      var target = mode || 'unknown';
+      if (target === 'unknown') {
+        applyMenuByMode('unknown');
+        updateRoleGuard();
+        return;
+      }
+      api('set_running_mode', { mode: target }, { singleFlight: true }, function (res) {
+        if (!res.status) {
+          showToast(res.text || '切换身份失败', true);
+          return;
+        }
+        applyMenuByMode(target);
+        updateRoleGuard();
+        showToast('已切换到' + (identityModeLabels[target] || target) + (sourceText ? '（' + sourceText + '）' : ''), false);
+      });
+    }
+
+    function mmsInitTab() {
+      api('get_running_mode', {}, { singleFlight: true }, function (res) {
+        var mode = 'unknown';
+        if (res.status && res.msg && res.msg.mode) mode = res.msg.mode;
+        applyMenuByMode(mode);
+        detectAndSuggestRole(function (suggested) {
+          if (mode === 'unknown') applyMenuByMode('unknown');
+          updateRoleGuard();
+          showIdentityGuide(true, '检测建议：' + (identityModeLabels[suggested] || suggested) + '。请选择身份后开始操作。');
+        });
+      });
     }
 
     $('.bt-w-main .bt-w-menu .bgw').on('click', function () {
       var idx = $(this).attr('data-mms-tab');
+      if (idx === undefined || idx === '') return;
+      mmsSetTab(idx);
+    });
+    $('.mms-step-link').on('click', function () {
+      var idx = $(this).attr('data-jump-tab');
       if (idx === undefined || idx === '') return;
       mmsSetTab(idx);
     });
@@ -576,6 +747,7 @@
     }
 
     $('#mapping_rows').on('input change', '.mapping-source-db, .mapping-target-db', syncMappingJsonPreview);
+    $('#boot_source_id,#boot_task_id,#mapping_source_id').on('input change', updateFlowGuard);
     $('#mapping_rows').on('click', '.mapping-remove-row', function () {
       var tr = $(this).closest('tr');
       if ($('#mapping_rows tr').length <= 1) {
@@ -590,6 +762,7 @@
     $('#btn-add-mapping-row').on('click', function () {
       appendMappingRow('', '');
       syncMappingJsonPreview();
+      updateFlowGuard();
     });
 
     $('#btn-load-mapping').on('click', function () {
@@ -608,6 +781,7 @@
         }
         syncMappingJsonPreview();
         showToast('已载入 ' + arr.length + ' 条映射', false);
+        updateFlowGuard();
       });
     });
 
@@ -646,7 +820,18 @@
       api('list_sources', {}, { singleFlight: true, reqKey: 'list_sources' }, function (res) {
         if (!res.status) return showToast(res.text || '请求失败', true);
         renderRows(res.msg || []);
+        updateFlowGuard();
       });
+    }
+
+    function updateFlowGuard() {
+      var sourceId = safeText($('#boot_source_id').val(), '');
+      var hasTaskId = safeText($('#boot_task_id').val(), '') !== '';
+      var mappingSource = safeText($('#mapping_source_id').val(), '');
+      var mappingRows = collectMappingsFromForm().length;
+      var hasMappingReady = mappingRows > 0 && mappingSource !== '';
+      $('#btn-create-boot').prop('disabled', !sourceId || !hasMappingReady);
+      $('#btn-run-boot,#btn-cancel-boot,#btn-task-detail,#btn-task-log').prop('disabled', !hasTaskId);
     }
 
     $('#btn-health').on('click', function () {
@@ -803,6 +988,7 @@
       api('set_db_mappings', { source_id: sourceId, mappings: JSON.stringify(list) }, function (res) {
         if (!res.status) return showToast(res.text || '映射保存失败', true);
         showToast('映射已保存', false);
+        updateFlowGuard();
       });
     });
     $('#btn-export-profile').on('click', function () {
@@ -863,6 +1049,7 @@
         var taskId = res.msg.task_id;
         $('#boot_task_id').val(taskId);
         showToast('任务创建成功: ' + taskId + '，已自动填入任务ID', false);
+        updateFlowGuard();
       });
     });
     $('#btn-list-boot').on('click', function () {
@@ -1026,9 +1213,34 @@
       });
     });
 
+    $('#btn-accept-role').on('click', function () {
+      showIdentityGuide(false);
+      setMode(state.suggestedMode || 'replica_mode', '采用自动推荐');
+    });
+    $('#btn-skip-role').on('click', function () {
+      showIdentityGuide(false);
+      applyMenuByMode(state.activeMode === 'unknown' ? 'replica_mode' : state.activeMode);
+      updateRoleGuard();
+      showToast('已跳过身份引导，你可随时在顶部切换', false);
+    });
+    $('#btn-force-replica, #btn-switch-replica').on('click', function () {
+      showIdentityGuide(false);
+      setMode('replica_mode', '手动切换');
+    });
+    $('#btn-force-master, #btn-switch-master').on('click', function () {
+      showIdentityGuide(false);
+      setMode('master_mode', '手动切换');
+    });
+    $('#btn-redetect-role').on('click', function () {
+      detectAndSuggestRole(function () {
+        showIdentityGuide(true);
+      });
+    });
+
     mmsInitTab();
     ensureMappingRowsInitialized();
     syncMappingJsonPreview();
+    updateFlowGuard();
     refreshList();
   })();
 </script>

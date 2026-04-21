@@ -534,6 +534,85 @@ class mysql_multi_source_main:
         data = self._load_config()
         return public.returnMsg(True, {"mode": data.get("mode", "replica_mode")})
 
+    def detect_running_mode(self, get=None):
+        data = self._load_config()
+        evidence = {
+            "saved_mode": data.get("mode", "replica_mode"),
+            "sources_count": len(data.get("sources", [])),
+            "running_sources": 0,
+            "master_health_ok": 0,
+            "master_health_fail": 0,
+            "master_health_warn": 0,
+            "reason_codes": [],
+        }
+        master_score = 0
+        replica_score = 0
+
+        sources = data.get("sources", [])
+        if len(sources) > 0:
+            replica_score += 45
+            evidence["reason_codes"].append("has_sources")
+        for source in sources:
+            status = source.get("status", {})
+            if status.get("running"):
+                evidence["running_sources"] += 1
+        if evidence["running_sources"] > 0:
+            replica_score += 20
+            evidence["reason_codes"].append("has_running_sources")
+
+        try:
+            report = self.master_health_check().get("msg", {})
+            summary = report.get("summary", {})
+            evidence["master_health_ok"] = int(summary.get("ok", 0) or 0)
+            evidence["master_health_fail"] = int(summary.get("fail", 0) or 0)
+            evidence["master_health_warn"] = int(summary.get("warn", 0) or 0)
+            if evidence["master_health_fail"] == 0 and evidence["master_health_ok"] >= 4:
+                master_score += 45
+                evidence["reason_codes"].append("master_health_good")
+            elif evidence["master_health_ok"] >= 2:
+                master_score += 25
+                evidence["reason_codes"].append("master_health_partial")
+            elif evidence["master_health_fail"] >= 3:
+                replica_score += 10
+                evidence["reason_codes"].append("master_health_failed")
+        except Exception as ex:
+            evidence["reason_codes"].append("master_health_error")
+            evidence["master_health_error"] = str(ex)
+
+        if evidence["saved_mode"] == "master_mode":
+            master_score += 10
+            evidence["reason_codes"].append("saved_mode_master")
+        elif evidence["saved_mode"] == "replica_mode":
+            replica_score += 10
+            evidence["reason_codes"].append("saved_mode_replica")
+
+        suggested_mode = "unknown"
+        confidence = 50
+        if master_score == replica_score:
+            suggested_mode = evidence["saved_mode"] if evidence["saved_mode"] in ["master_mode", "replica_mode"] else "unknown"
+            confidence = 55 if suggested_mode != "unknown" else 50
+            evidence["reason_codes"].append("score_tie")
+        elif master_score > replica_score:
+            suggested_mode = "master_mode"
+            confidence = min(100, 55 + (master_score - replica_score))
+        else:
+            suggested_mode = "replica_mode"
+            confidence = min(100, 55 + (replica_score - master_score))
+
+        return self._ok(
+            {
+                "suggested_mode": suggested_mode,
+                "confidence": int(confidence),
+                "scores": {
+                    "master_mode": master_score,
+                    "replica_mode": replica_score,
+                },
+                "evidence": evidence,
+            },
+            "身份检测完成",
+            "IDENTITY_DETECTED",
+        )
+
     def master_health_check(self, get=None):
         report = {
             "items": [],
