@@ -714,6 +714,21 @@ class mysql_multi_source_main:
         if not os.path.exists(backup_dir):
             os.makedirs(backup_dir)
 
+        # Log paths for full-fidelity debugging. Users can open these via the
+        # plugin's task log viewer instead of relying on truncated snippets.
+        backup_log = os.path.join(task_dir, "xb_backup.stderr.log")
+        prepare_log = os.path.join(task_dir, "xb_prepare.stderr.log")
+
+        def _dump_stderr(path, content):
+            try:
+                with open(path, "wb") as f:
+                    if isinstance(content, str):
+                        f.write(content.encode("utf-8", errors="replace"))
+                    else:
+                        f.write(content or b"")
+            except Exception:
+                pass
+
         # Stream backup over SSH. Password is passed via MYSQL_PWD on remote via env, not argv.
         # Because ssh spawns a remote shell we use `env MYSQL_PWD=... tool ...` on the remote side,
         # where the password is still visible in ps; it is unavoidable without a .mylogin.cnf.
@@ -734,18 +749,64 @@ class mysql_multi_source_main:
         )
         self._append_task_log(task_id, "[physical] 开始流式备份到: {}".format(backup_dir))
         r = self._run_shell(pipeline, shell=True, timeout=7200)
+        _dump_stderr(backup_log, r.get("stderr") or "")
         if r["code"] != 0:
-            err = (r.get("stderr") or "")[:500]
+            err = (r.get("stderr") or "")[:800]
             self._append_task_log(task_id, "[physical] backup 失败，降级 logical：{}".format(err))
+            self._append_task_log(task_id, "[physical] 完整日志: {} （主库侧: /tmp/mms_xb.err）".format(backup_log))
             task["effective_mode_note"] = "fallback_logical_backup_fail"
             return self._run_logical_bootstrap(source, task)
         self._append_task_log(task_id, "[physical] 流式备份完成")
 
-        # Prepare (apply-log)
-        r = self._run_shell([tool, "--prepare", "--target-dir=" + backup_dir], timeout=3600)
+        # Inspect the backup dir so we know partial/full and size, which helps
+        # diagnose prepare failures (e.g. empty backup = nothing to apply).
+        try:
+            xb_entries = os.listdir(backup_dir)
+            xb_total_mb = 0.0
+            for root_d, _dirs, files in os.walk(backup_dir):
+                for fn in files:
+                    try:
+                        xb_total_mb += os.path.getsize(os.path.join(root_d, fn)) / 1024.0 / 1024.0
+                    except Exception:
+                        pass
+            self._append_task_log(
+                task_id,
+                "[physical] 备份目录内容: {} 项, 约 {:.2f} MB (顶层: {})".format(
+                    len(xb_entries), xb_total_mb, ", ".join(xb_entries[:6]) + ("..." if len(xb_entries) > 6 else "")
+                ),
+            )
+        except Exception as ex:
+            self._append_task_log(task_id, "[physical] 无法枚举备份目录: {}".format(ex))
+
+        # Prepare (apply-log). For partial (--databases=) backups on xtrabackup 8.0+
+        # the --export flag is required so prepare generates per-table .cfg/.ibd
+        # files usable for the subsequent import. We try --prepare --export first;
+        # if that fails (older xtrabackup or full-instance layout), retry plain
+        # --prepare. The full stderr is always written to prepare_log for diag.
+        def _try_prepare(extra_args):
+            return self._run_shell(
+                [tool, "--prepare"] + extra_args + ["--target-dir=" + backup_dir],
+                timeout=3600,
+            )
+
+        self._append_task_log(task_id, "[physical] prepare: 尝试 --prepare --export")
+        r = _try_prepare(["--export"])
         if r["code"] != 0:
-            err = (r.get("stderr") or "")[:500]
-            self._append_task_log(task_id, "[physical] prepare 失败，降级 logical：{}".format(err))
+            _dump_stderr(prepare_log + ".export", r.get("stderr") or "")
+            self._append_task_log(task_id, "[physical] --export 方式失败，回退普通 --prepare")
+            r = _try_prepare([])
+        _dump_stderr(prepare_log, r.get("stderr") or "")
+
+        if r["code"] != 0:
+            # Keep a longer snippet so the real error is visible in the UI log.
+            raw = r.get("stderr") or ""
+            snippet = raw[-1500:] if len(raw) > 1500 else raw
+            self._append_task_log(
+                task_id,
+                "[physical] prepare 失败，降级 logical（完整日志: {}）。\n错误尾部：\n{}".format(
+                    prepare_log, snippet,
+                ),
+            )
             task["effective_mode_note"] = "fallback_logical_prepare_fail"
             return self._run_logical_bootstrap(source, task)
         self._append_task_log(task_id, "[physical] prepare 完成，数据已物理化到本地")
