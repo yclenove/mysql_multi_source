@@ -133,3 +133,18 @@
 - 前端新增主库协同向导入口：
   - 主库检测、修复、重启、审计、回滚
   - 签名配置与握手导入流程
+
+## 阶段十八进展（已完成）
+
+- 全量审计与修复：
+  - 输出 `docs/全量Review报告.md`，按高/中/低风险归类问题并给出修复项
+- 前端重构（保持宝塔插件无构建链）：
+  - `index.html` 新增请求适配层（错误标准化、singleFlight、请求顺序保护）
+  - 新增统一结果面板与按钮执行态，减少重复提交与信息丢失
+  - 来源列表渲染改为安全转义，修复关键 XSS 风险点
+  - 统一文本弹窗出口，降低拼接型渲染风险
+  - 初始化任务创建后自动回填 `task_id`，优化流程连续性
+- 后端契约收敛：
+  - `mysql_multi_source_main.py` 新增 `_ok/_fail` 返回辅助
+  - 新增 `source_id` 校验与 `master_port` 范围校验
+  - `add_source/set_db_mappings/create_bootstrap_task/trigger_bootstrap_task` 关键路径改为结构化错误返回

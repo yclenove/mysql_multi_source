@@ -133,6 +133,23 @@
     min-height: 120px;
     padding-bottom: 8px;
   }
+  .mms-root .mms-result-panel {
+    border: 1px solid #e6e8eb;
+    background: #f8fafc;
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin-bottom: 12px;
+    font-size: 12px;
+    color: #334155;
+    display: none;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .mms-root .mms-result-panel.is-error {
+    border-color: #fecaca;
+    background: #fef2f2;
+    color: #991b1b;
+  }
   .mms-root .mms-tab-pane[hidden],
   .mms-root .mms-tab-pane.is-hidden {
     display: none !important;
@@ -159,6 +176,7 @@
     <p class="bgw" data-mms-tab="3" title="主库本机运维与协同">主库与协同</p>
   </div>
   <div class="bt-w-con pd15 mms-root plugin_body">
+    <div id="mms_result_panel" class="mms-result-panel"></div>
     <!-- 工作台：从库日常 -->
     <div class="mms-tab-pane" data-mms-tab="0">
       <div class="mms-card">
@@ -384,12 +402,105 @@
 
 <script type="text/javascript">
   (function () {
-    function api(method, data, cb) {
+    var state = {
+      pending: {},
+      latestReq: {}
+    };
+
+    function esc(value) {
+      return $('<div/>').text(value == null ? '' : String(value)).html();
+    }
+
+    function safeText(value, fallback) {
+      var raw = value == null ? '' : String(value);
+      var trimmed = raw.trim();
+      if (trimmed) return trimmed;
+      return fallback || '';
+    }
+
+    function showResult(message, isError) {
+      var $panel = $('#mms_result_panel');
+      if (!message) {
+        $panel.hide().removeClass('is-error').text('');
+        return;
+      }
+      $panel.text(String(message));
+      $panel.toggleClass('is-error', !!isError).show();
+    }
+
+    function showToast(message, isError, time) {
+      var text = safeText(message, isError ? '操作失败' : '操作成功');
+      layer.msg(text, { icon: isError ? 2 : 1, time: time || (isError ? 4000 : 2500) });
+      showResult(text, !!isError);
+    }
+
+    function setBtnPending($btn, pending, text) {
+      if (!$btn || !$btn.length) return;
+      if (pending) {
+        if ($btn.data('origin-text') == null) $btn.data('origin-text', $btn.text());
+        $btn.prop('disabled', true).addClass('disabled');
+        if (text) $btn.text(text);
+        return;
+      }
+      var originText = $btn.data('origin-text');
+      $btn.prop('disabled', false).removeClass('disabled');
+      if (originText != null) $btn.text(originText);
+    }
+
+    function normalizeRes(res) {
+      var raw = res || {};
+      var msg = raw.msg;
+      var text = '';
+      if (typeof msg === 'string') text = msg;
+      if (!text && msg && typeof msg === 'object' && typeof msg.message === 'string') text = msg.message;
+      if (!text && typeof raw.message === 'string') text = raw.message;
+      return {
+        status: !!raw.status,
+        msg: msg,
+        text: text || (raw.status ? '' : '请求失败')
+      };
+    }
+
+    function api(method, data, options, cb) {
+      var opts = options || {};
+      var key = method + '::' + JSON.stringify(data || {});
+      if (opts.singleFlight && state.pending[key]) return;
+      if (opts.singleFlight) state.pending[key] = true;
+      if (opts.reqKey) {
+        state.latestReq[opts.reqKey] = (state.latestReq[opts.reqKey] || 0) + 1;
+        opts.reqSeq = state.latestReq[opts.reqKey];
+      }
       bt_tools.send({
         url: '/plugin?action=a&name=mysql_multi_source&s=' + method,
         data: data || {}
       }, function (res) {
-        cb && cb(res);
+        if (opts.singleFlight) delete state.pending[key];
+        if (opts.reqKey && opts.reqSeq !== state.latestReq[opts.reqKey]) return;
+        cb && cb(normalizeRes(res));
+      });
+    }
+
+    function runAction(selector, method, payload, cfg) {
+      var opts = cfg || {};
+      var $btn = $(selector);
+      setBtnPending($btn, true, opts.pendingText || '处理中...');
+      api(method, payload || {}, { singleFlight: true }, function (res) {
+        setBtnPending($btn, false);
+        if (!res.status) {
+          showToast(opts.failText || res.text, true);
+          return;
+        }
+        if (opts.onSuccess) opts.onSuccess(res);
+        if (opts.successText) showToast(opts.successText, false);
+      });
+    }
+
+    function openTextDialog(title, text, area) {
+      layer.open({
+        type: 1,
+        area: area || ['760px', '420px'],
+        title: title,
+        content: '<div style="padding:12px;"><pre style="max-height:360px;overflow:auto;">' + esc(text || '暂无数据') + '</pre></div>'
       });
     }
 
@@ -483,9 +594,9 @@
 
     $('#btn-load-mapping').on('click', function () {
       var sourceId = $('#mapping_source_id').val();
-      if (!sourceId) return layer.msg('请先填写来源ID', { icon: 0 });
+      if (!sourceId) return showToast('请先填写来源ID', true);
       api('list_db_mappings', { source_id: sourceId }, function (res) {
-        if (!res.status) return layer.msg(res.msg || '载入失败', { icon: 2 });
+        if (!res.status) return showToast(res.text || '载入失败', true);
         $('#mapping_rows').empty();
         var arr = res.msg || [];
         if (!arr.length) {
@@ -496,7 +607,7 @@
           });
         }
         syncMappingJsonPreview();
-        layer.msg('已载入 ' + arr.length + ' 条映射', { icon: 1 });
+        showToast('已载入 ' + arr.length + ' 条映射', false);
       });
     });
 
@@ -508,19 +619,23 @@
       }
       list.forEach(function (item) {
         var status = (item.status && item.status.running) ? '运行中' : '已停止';
+        var sid = safeText(item.source_id, '-');
+        var channel = safeText(item.channel_name, '-');
+        var host = safeText(item.master_host, '-');
+        var port = safeText(item.master_port, '3306');
         rows += '<tr>' +
-          '<td>' + item.source_id + '</td>' +
-          '<td>' + item.channel_name + '</td>' +
-          '<td>' + item.master_host + ':' + item.master_port + '</td>' +
+          '<td>' + esc(sid) + '</td>' +
+          '<td>' + esc(channel) + '</td>' +
+          '<td>' + esc(host + ':' + port) + '</td>' +
           '<td>' + status + '</td>' +
           '<td>' +
-            '<a href="javascript:;" class="btlink source-start mr10" data-id="' + item.source_id + '">启动</a>' +
-            '<a href="javascript:;" class="btlink source-stop mr10" data-id="' + item.source_id + '">停止</a>' +
-            '<a href="javascript:;" class="btlink source-test mr10" data-id="' + item.source_id + '">连通性</a>' +
-            '<a href="javascript:;" class="btlink source-status mr10" data-id="' + item.source_id + '">状态</a>' +
-            '<a href="javascript:;" class="btlink source-diagnose mr10" data-id="' + item.source_id + '">诊断</a>' +
-            '<a href="javascript:;" class="btlink source-log mr10" data-id="' + item.source_id + '">日志</a>' +
-            '<a href="javascript:;" class="btlink source-delete" data-id="' + item.source_id + '" style="color:#d9534f;">删除</a>' +
+            '<a href="javascript:;" class="btlink source-start mr10" data-id="' + esc(sid) + '">启动</a>' +
+            '<a href="javascript:;" class="btlink source-stop mr10" data-id="' + esc(sid) + '">停止</a>' +
+            '<a href="javascript:;" class="btlink source-test mr10" data-id="' + esc(sid) + '">连通性</a>' +
+            '<a href="javascript:;" class="btlink source-status mr10" data-id="' + esc(sid) + '">状态</a>' +
+            '<a href="javascript:;" class="btlink source-diagnose mr10" data-id="' + esc(sid) + '">诊断</a>' +
+            '<a href="javascript:;" class="btlink source-log mr10" data-id="' + esc(sid) + '">日志</a>' +
+            '<a href="javascript:;" class="btlink source-delete" data-id="' + esc(sid) + '" style="color:#d9534f;">删除</a>' +
           '</td>' +
           '</tr>';
       });
@@ -528,38 +643,42 @@
     }
 
     function refreshList() {
-      api('list_sources', {}, function (res) {
-        if (!res.status) return layer.msg(res.msg || '请求失败', { icon: 2 });
+      api('list_sources', {}, { singleFlight: true, reqKey: 'list_sources' }, function (res) {
+        if (!res.status) return showToast(res.text || '请求失败', true);
         renderRows(res.msg || []);
       });
     }
 
     $('#btn-health').on('click', function () {
-      api('health_check', {}, function (res) {
-        if (!res.status) return layer.msg(res.msg || '健康检查失败', { icon: 2 });
-        layer.msg('来源数: ' + (res.msg.sources_count || 0), { icon: 1 });
+      runAction('#btn-health', 'health_check', {}, {
+        pendingText: '检查中...',
+        onSuccess: function (res) {
+          showToast('来源数: ' + ((res.msg && res.msg.sources_count) || 0), false);
+        }
       });
     });
     $('#btn-gtid').on('click', function () {
       api('get_gtid_status', {}, function (res) {
-        if (!res.status) return layer.msg(res.msg || 'GTID检查失败', { icon: 2 });
-        layer.msg('GTID模式: ' + res.msg.gtid_mode, { icon: res.msg.enabled ? 1 : 0 });
+        if (!res.status) return showToast(res.text || 'GTID检查失败', true);
+        showToast('GTID模式: ' + res.msg.gtid_mode, !res.msg.enabled);
       });
     });
     $('#btn-master-health').on('click', function () {
-      api('master_health_check', {}, function (res) {
-        if (!res.status) return layer.msg(res.msg || '主库检测失败', { icon: 2 });
+      runAction('#btn-master-health', 'master_health_check', {}, {
+        pendingText: '检测中...',
+        onSuccess: function (res) {
         var rows = (res.msg.items || []).map(function (i) {
           return i.name + ' | ' + i.status + ' | 当前=' + i.current + ' | 期望=' + i.expected + ' | 建议=' + i.suggestion;
         }).join('\n');
-        layer.open({ type: 1, area: ['900px', '460px'], title: '主库检测报告', content: '<div style="padding:12px;"><pre>' + rows + '</pre></div>' });
+          openTextDialog('主库检测报告', rows, ['900px', '460px']);
+        }
       });
     });
     $('#btn-master-preview').on('click', function () {
       api('master_auto_fix_preview', {}, function (res) {
-        if (!res.status) return layer.msg(res.msg || '预览失败', { icon: 2 });
+        if (!res.status) return showToast(res.text || '预览失败', true);
         var txt = 'need_restart=' + res.msg.need_restart + '\n' + (res.msg.actions || []).join('\n');
-        layer.open({ type: 1, area: ['760px', '380px'], title: '修复预览', content: '<div style="padding:12px;"><pre>' + txt + '</pre></div>' });
+        openTextDialog('修复预览', txt, ['760px', '380px']);
       });
     });
     $('#btn-master-fix').on('click', function () {
@@ -571,7 +690,7 @@
           repl_password: $('#master_repl_password').val(),
           replica_host: $('#master_replica_host').val()
         }, function (res) {
-          if (!res.status) return layer.msg(res.msg || '修复失败', { icon: 2 });
+          if (!res.status) return showToast(res.text || '修复失败', true);
           var tail = '';
           if (res.msg.auto_restart) {
             if (res.msg.restart_result && res.msg.restart_result.ok) {
@@ -582,7 +701,7 @@
           } else if (res.msg.need_restart) {
             tail = '，建议手工重启MySQL';
           }
-          layer.msg('修复完成，snapshot=' + res.msg.snapshot_id + tail, { icon: 1, time: 7000 });
+          showToast('修复完成，snapshot=' + res.msg.snapshot_id + tail, false, 7000);
         });
       });
     });
@@ -592,8 +711,8 @@
         repl_password: $('#master_repl_password').val(),
         replica_host: $('#master_replica_host').val()
       }, function (res) {
-        if (!res.status) return layer.msg(res.msg || '创建失败', { icon: 2 });
-        layer.msg(res.msg || '创建成功', { icon: 1 });
+        if (!res.status) return showToast(res.text || '创建失败', true);
+        showToast(res.msg || '创建成功', false);
       });
     });
     $('#btn-master-connect-test').on('click', function () {
@@ -605,16 +724,16 @@
       }, function (res) {
         if (!res.status) {
           var r = res.msg || {};
-          return layer.msg((r.msg || '连接失败') + ' [' + (r.reason || 'unknown') + ']', { icon: 2, time: 5000 });
+          return showToast((r.msg || '连接失败') + ' [' + (r.reason || 'unknown') + ']', true, 5000);
         }
-        layer.msg((res.msg.msg || '连接成功') + ' [' + (res.msg.reason || 'ok') + ']', { icon: 1, time: 5000 });
+        showToast((res.msg.msg || '连接成功') + ' [' + (res.msg.reason || 'ok') + ']', false, 5000);
       });
     });
     $('#btn-master-restart').on('click', function () {
       bt.confirm({ title: '高危操作', msg: '确认重启MySQL服务？' }, function () {
         api('master_restart_mysql', {}, function (res) {
-          if (!res.status) return layer.msg(res.msg || '重启失败', { icon: 2 });
-          layer.msg(res.msg || '重启成功', { icon: 1 });
+          if (!res.status) return showToast(res.text || '重启失败', true);
+          showToast(res.msg || '重启成功', false);
         });
       });
     });
@@ -622,7 +741,7 @@
     $('#btn-refresh').on('click', refreshList);
     $('#btn-check-tools').on('click', function () {
       api('check_bootstrap_tools', {}, function (res) {
-        if (!res.status) return layer.msg(res.msg || '检测失败', { icon: 2 });
+        if (!res.status) return showToast(res.text || '检测失败', true);
         var r = res.msg;
         var text = 'root=' + r.is_root +
           '\nos=' + r.os_family +
@@ -631,37 +750,32 @@
           '\nmysqldump=' + r.mysqldump +
           '\nmysql=' + r.mysql +
           '\nrecommended_mode=' + r.recommended_mode;
-        layer.open({
-          type: 1,
-          area: ['620px', '360px'],
-          title: '工具检测结果',
-          content: '<div style="padding:12px;"><pre>' + text + '</pre></div>'
-        });
+        openTextDialog('工具检测结果', text, ['620px', '360px']);
       });
     });
     $('#btn-overview').on('click', function () {
       api('overview_metrics', {}, function (res) {
-        if (!res.status) return layer.msg(res.msg || '总览获取失败', { icon: 2 });
+        if (!res.status) return showToast(res.text || '总览获取失败', true);
         var m = res.msg;
-        layer.msg('总数=' + m.total_sources + ', 运行=' + m.running_sources + ', 停止=' + m.stopped_sources + ', 异常=' + m.error_sources + ', 初始化任务=' + m.bootstrap_tasks, { icon: 1, time: 6000 });
+        showToast('总数=' + m.total_sources + ', 运行=' + m.running_sources + ', 停止=' + m.stopped_sources + ', 异常=' + m.error_sources + ', 初始化任务=' + m.bootstrap_tasks, false, 6000);
       });
     });
     $('#btn-audit-logs').on('click', function () {
       api('list_audit_logs', {}, function (res) {
-        if (!res.status) return layer.msg(res.msg || '获取失败', { icon: 2 });
+        if (!res.status) return showToast(res.text || '获取失败', true);
         var txt = (res.msg || []).map(function (a) {
           return a.id + ' | ' + a.action + ' | ' + JSON.stringify(a.detail);
         }).join('\n');
-        layer.open({ type: 1, area: ['900px', '460px'], title: '审计日志', content: '<div style="padding:12px;"><pre>' + (txt || '暂无日志') + '</pre></div>' });
+        openTextDialog('审计日志', txt || '暂无日志', ['900px', '460px']);
       });
     });
     $('#btn-snapshots').on('click', function () {
       api('list_change_snapshots', {}, function (res) {
-        if (!res.status) return layer.msg(res.msg || '获取失败', { icon: 2 });
+        if (!res.status) return showToast(res.text || '获取失败', true);
         var txt = (res.msg || []).map(function (s) {
           return s.snapshot_id + ' | ' + s.category + ' | ' + s.created_at;
         }).join('\n');
-        layer.open({ type: 1, area: ['760px', '420px'], title: '回滚快照', content: '<div style="padding:12px;"><pre>' + (txt || '暂无快照') + '</pre></div>' });
+        openTextDialog('回滚快照', txt || '暂无快照', ['760px', '420px']);
       });
     });
 
@@ -675,20 +789,20 @@
         repl_password: $('#repl_password').val()
       };
       api('add_source', data, function (res) {
-        if (!res.status) return layer.msg(res.msg || '添加失败', { icon: 2 });
-        layer.msg('添加成功', { icon: 1 });
+        if (!res.status) return showToast(res.text || '添加失败', true);
+        showToast('添加成功', false);
         refreshList();
       });
     });
     $('#btn-set-mapping').on('click', function () {
       var sourceId = $('#mapping_source_id').val();
-      if (!sourceId) return layer.msg('请先填写来源ID', { icon: 0 });
+      if (!sourceId) return showToast('请先填写来源ID', true);
       syncMappingJsonPreview();
       var list = collectMappingsFromForm();
-      if (!list.length) return layer.msg('请至少填写一行「主库库名」与「从库目标库名」', { icon: 0 });
+      if (!list.length) return showToast('请至少填写一行「主库库名」与「从库目标库名」', true);
       api('set_db_mappings', { source_id: sourceId, mappings: JSON.stringify(list) }, function (res) {
-        if (!res.status) return layer.msg(res.msg || '映射保存失败', { icon: 2 });
-        layer.msg('映射已保存', { icon: 1 });
+        if (!res.status) return showToast(res.text || '映射保存失败', true);
+        showToast('映射已保存', false);
       });
     });
     $('#btn-export-profile').on('click', function () {
@@ -703,73 +817,69 @@
         db_mappings: $('#mapping_json').val() || '[]'
       };
       api('master_export_signed_profile', data, function (res) {
-        if (!res.status) return layer.msg(res.msg || '导出失败', { icon: 2 });
+        if (!res.status) return showToast(res.text || '导出失败', true);
         $('#profile_b64').val(res.msg.profile_b64 || '');
-        layer.msg('导出成功 profile_id=' + res.msg.profile_id, { icon: 1 });
+        showToast('导出成功 profile_id=' + res.msg.profile_id, false);
       });
     });
     $('#btn-verify-profile').on('click', function () {
       api('replica_verify_profile', { profile_b64: $('#profile_b64').val() }, function (res) {
-        if (!res.status) return layer.msg(res.msg || '验证失败', { icon: 2 });
-        layer.msg('验证结果: ' + (res.msg.verified ? '通过' : '失败'), { icon: res.msg.verified ? 1 : 2 });
+        if (!res.status) return showToast(res.text || '验证失败', true);
+        showToast('验证结果: ' + (res.msg.verified ? '通过' : '失败'), !res.msg.verified);
       });
     });
     $('#btn-import-profile').on('click', function () {
       api('replica_import_profile', { profile_b64: $('#profile_b64').val() }, function (res) {
-        if (!res.status) return layer.msg(res.msg || '导入失败', { icon: 2 });
-        layer.msg(res.msg || '导入成功', { icon: 1 });
+        if (!res.status) return showToast(res.text || '导入失败', true);
+        showToast(res.msg || '导入成功', false);
         refreshList();
       });
     });
     $('#btn-create-handshake').on('click', function () {
       api('master_create_handshake', { profile_b64: $('#profile_b64').val() }, function (res) {
-        if (!res.status) return layer.msg(res.msg || '创建失败', { icon: 2 });
+        if (!res.status) return showToast(res.text || '创建失败', true);
         $('#handshake_token').val(res.msg.token || '');
-        layer.msg('握手token已生成', { icon: 1 });
+        showToast('握手token已生成', false);
       });
     });
     $('#btn-accept-handshake').on('click', function () {
       api('replica_accept_handshake', { token: $('#handshake_token').val() }, function (res) {
-        if (!res.status) return layer.msg(res.msg || '接收失败', { icon: 2 });
-        layer.msg(res.msg || '接收成功', { icon: 1 });
+        if (!res.status) return showToast(res.text || '接收失败', true);
+        showToast(res.msg || '接收成功', false);
         refreshList();
       });
     });
     $('#btn-handshake-status').on('click', function () {
       api('handshake_status', { token: $('#handshake_token').val() }, function (res) {
-        if (!res.status) return layer.msg(res.msg || '查询失败', { icon: 2 });
-        layer.open({ type: 1, area: ['760px', '380px'], title: '握手状态', content: '<div style="padding:12px;"><pre>' + JSON.stringify(res.msg, null, 2) + '</pre></div>' });
+        if (!res.status) return showToast(res.text || '查询失败', true);
+        openTextDialog('握手状态', JSON.stringify(res.msg, null, 2), ['760px', '380px']);
       });
     });
     $('#btn-create-boot').on('click', function () {
       var sourceId = $('#boot_source_id').val();
       var mode = $('#boot_mode').val();
       api('create_bootstrap_task', { source_id: sourceId, mode: mode }, function (res) {
-        if (!res.status) return layer.msg(res.msg || '创建任务失败', { icon: 2 });
+        if (!res.status) return showToast(res.text || '创建任务失败', true);
         var taskId = res.msg.task_id;
-        layer.msg('任务创建成功: ' + taskId, { icon: 1 });
+        $('#boot_task_id').val(taskId);
+        showToast('任务创建成功: ' + taskId + '，已自动填入任务ID', false);
       });
     });
     $('#btn-list-boot').on('click', function () {
       api('get_bootstrap_tasks', {}, function (res) {
-        if (!res.status) return layer.msg(res.msg || '任务获取失败', { icon: 2 });
+        if (!res.status) return showToast(res.text || '任务获取失败', true);
         var text = (res.msg || []).map(function (t) {
           return t.task_id + ' | ' + t.source_id + ' | ' + t.mode + ' | ' + t.status + ' | ' + t.current_step;
         }).join('\n');
-        layer.open({
-          type: 1,
-          area: ['800px', '420px'],
-          title: '初始化任务列表',
-          content: '<div style="padding:12px;"><pre style="max-height:360px;overflow:auto;">' + (text || '暂无任务') + '</pre></div>'
-        });
+        openTextDialog('初始化任务列表', text || '暂无任务', ['800px', '420px']);
       });
     });
     $('#btn-run-boot').on('click', function () {
       var taskId = $('#boot_task_id').val();
       bt.confirm({ title: '执行确认', msg: '确认后台执行任务: ' + taskId + ' ?' }, function () {
         api('trigger_bootstrap_task', { task_id: taskId }, function (res) {
-          if (!res.status) return layer.msg(res.msg || '触发失败', { icon: 2 });
-          layer.msg('已后台执行', { icon: 1 });
+          if (!res.status) return showToast(res.text || '触发失败', true);
+          showToast('已后台执行', false);
         });
       });
     });
@@ -777,53 +887,35 @@
       var taskId = $('#boot_task_id').val();
       bt.confirm({ title: '取消确认', msg: '确认取消任务: ' + taskId + ' ?' }, function () {
         api('cancel_bootstrap_task', { task_id: taskId }, function (res) {
-          if (!res.status) return layer.msg(res.msg || '取消失败', { icon: 2 });
-          layer.msg('任务已取消', { icon: 1 });
+          if (!res.status) return showToast(res.text || '取消失败', true);
+          showToast('任务已取消', false);
         });
       });
     });
     $('#btn-task-detail').on('click', function () {
       var taskId = $('#boot_task_id').val();
       api('get_bootstrap_task', { task_id: taskId }, function (res) {
-        if (!res.status) return layer.msg(res.msg || '获取失败', { icon: 2 });
-        layer.open({
-          type: 1,
-          area: ['760px', '420px'],
-          title: '任务详情',
-          content: '<div style="padding:12px;"><pre>' + JSON.stringify(res.msg, null, 2) + '</pre><div class="mt10">可每5-10秒刷新一次查看进度。</div></div>'
-        });
+        if (!res.status) return showToast(res.text || '获取失败', true);
+        openTextDialog('任务详情', JSON.stringify(res.msg, null, 2) + '\n\n可每5-10秒刷新一次查看进度。', ['760px', '420px']);
       });
     });
     $('#btn-task-log').on('click', function () {
       var taskId = $('#boot_task_id').val();
       api('get_task_logs', { task_id: taskId }, function (res) {
-        if (!res.status) return layer.msg(res.msg || '获取失败', { icon: 2 });
-        layer.open({
-          type: 1,
-          area: ['760px', '420px'],
-          title: '任务日志',
-          content: '<div style="padding:12px;"><pre style="max-height:360px;overflow:auto;">' + (res.msg || '暂无日志') + '</pre></div>'
-        });
+        if (!res.status) return showToast(res.text || '获取失败', true);
+        openTextDialog('任务日志', res.msg || '暂无日志', ['760px', '420px']);
       });
     });
     $('#btn-install-tool').on('click', function () {
       var toolName = $('#tool_name').val();
       bt.confirm({ title: '安装确认', msg: '确认安装工具: ' + toolName + ' ?' }, function () {
         api('install_bootstrap_tool', { tool_name: toolName }, function (res) {
-          if (res.status) {
-            layer.msg('安装成功', { icon: 1 });
-            return;
-          }
+          if (res.status) return showToast('安装成功', false);
           if (res.msg && typeof res.msg === 'object' && res.msg.need_root) {
-            layer.open({
-              type: 1,
-              area: ['760px', '300px'],
-              title: '需要root手工执行',
-              content: '<div style="padding:12px;"><pre>' + res.msg.msg + '\n\n手工命令:\n' + res.msg.manual_cmd + '</pre></div>'
-            });
+            openTextDialog('需要root手工执行', (res.msg.msg || '') + '\n\n手工命令:\n' + (res.msg.manual_cmd || ''), ['760px', '300px']);
             return;
           }
-          layer.msg((res.msg && res.msg.msg) || res.msg || '安装失败', { icon: 2 });
+          showToast((res.msg && res.msg.msg) || res.text || '安装失败', true);
         });
       });
     });
@@ -831,32 +923,22 @@
       var toolName = $('#tool_name').val();
       bt.confirm({ title: '重试确认', msg: '确认重试安装工具: ' + toolName + ' ?' }, function () {
         api('install_bootstrap_tool', { tool_name: toolName, retry: '1' }, function (res) {
-          if (res.status) return layer.msg('重试安装成功', { icon: 1 });
-          layer.msg((res.msg && res.msg.msg) || res.msg || '重试失败', { icon: 2 });
+          if (res.status) return showToast('重试安装成功', false);
+          showToast((res.msg && res.msg.msg) || res.text || '重试失败', true);
         });
       });
     });
     $('#btn-copy-tool-cmd').on('click', function () {
       var toolName = $('#tool_name').val();
       api('get_tool_install_command', { tool_name: toolName }, function (res) {
-        if (!res.status) return layer.msg(res.msg || '获取失败', { icon: 2 });
-        layer.open({
-          type: 1,
-          area: ['760px', '280px'],
-          title: '安装命令（可复制）',
-          content: '<div style="padding:12px;"><pre>' + res.msg.command + '</pre></div>'
-        });
+        if (!res.status) return showToast(res.text || '获取失败', true);
+        openTextDialog('安装命令（可复制）', res.msg.command || '', ['760px', '280px']);
       });
     });
     $('#btn-tool-log').on('click', function () {
       api('get_tool_install_log', {}, function (res) {
-        if (!res.status) return layer.msg(res.msg || '获取失败', { icon: 2 });
-        layer.open({
-          type: 1,
-          area: ['760px', '420px'],
-          title: '工具安装日志',
-          content: '<div style="padding:12px;"><pre style="max-height:360px;overflow:auto;">' + (res.msg || '暂无日志') + '</pre></div>'
-        });
+        if (!res.status) return showToast(res.text || '获取失败', true);
+        openTextDialog('工具安装日志', res.msg || '暂无日志', ['760px', '420px']);
       });
     });
     $('#btn-stress-run').on('click', function () {
@@ -865,32 +947,29 @@
         task_per_source: $('#stress_task_per_source').val(),
         mode: $('#stress_mode').val()
       }, function (res) {
-        if (!res.status) return layer.msg(res.msg || '压测启动失败', { icon: 2 });
-        layer.msg('压测已启动，创建任务=' + res.msg.created + ', 失败=' + res.msg.failed, { icon: 1, time: 6000 });
+        if (!res.status) return showToast(res.text || '压测启动失败', true);
+        showToast('压测已启动，创建任务=' + res.msg.created + ', 失败=' + res.msg.failed, false, 6000);
       });
     });
     $('#btn-stress-report').on('click', function () {
       api('get_stress_report', {}, function (res) {
-        if (!res.status) return layer.msg(res.msg || '获取失败', { icon: 2 });
-        layer.open({
-          type: 1,
-          area: ['760px', '420px'],
-          title: '压测报告',
-          content: '<div style="padding:12px;"><pre>' + JSON.stringify(res.msg, null, 2) + '</pre></div>'
-        });
+        if (!res.status) return showToast(res.text || '获取失败', true);
+        openTextDialog('压测报告', JSON.stringify(res.msg, null, 2), ['760px', '420px']);
       });
     });
 
     $('.mms-root').off('click', '.source-start').on('click', '.source-start', function () {
       api('start_channel', { source_id: $(this).data('id') }, function (res) {
-        if (!res.status) return layer.msg(res.msg || '启动失败', { icon: 2 });
+        if (!res.status) return showToast(res.text || '启动失败', true);
+        showToast('通道启动成功', false);
         refreshList();
       });
     });
 
     $('.mms-root').off('click', '.source-stop').on('click', '.source-stop', function () {
       api('stop_channel', { source_id: $(this).data('id') }, function (res) {
-        if (!res.status) return layer.msg(res.msg || '停止失败', { icon: 2 });
+        if (!res.status) return showToast(res.text || '停止失败', true);
+        showToast('通道已停止', false);
         refreshList();
       });
     });
@@ -898,47 +977,38 @@
       api('test_source_connection', { source_id: $(this).data('id') }, function (res) {
         var msg = res.msg;
         if (typeof msg === 'object') {
-          layer.msg((msg.msg || (res.status ? '连通' : '不通')) + ' [' + (msg.reason || 'unknown') + ']', { icon: res.status ? 1 : 2, time: 5000 });
+          showToast((msg.msg || (res.status ? '连通' : '不通')) + ' [' + (msg.reason || 'unknown') + ']', !res.status, 5000);
         } else {
-          layer.msg(msg || (res.status ? '连通' : '不通'), { icon: res.status ? 1 : 2 });
+          showToast(msg || (res.status ? '连通' : '不通'), !res.status);
         }
       });
     });
     $('.mms-root').off('click', '.source-status').on('click', '.source-status', function () {
       api('channel_status', { source_id: $(this).data('id') }, function (res) {
-        if (!res.status) return layer.msg(res.msg || '状态获取失败', { icon: 2 });
+        if (!res.status) return showToast(res.text || '状态获取失败', true);
         var msg = 'IO=' + res.msg.io_running + ', SQL=' + res.msg.sql_running + ', 延迟=' + res.msg.seconds_behind;
         if (res.msg.last_error) msg += ', 错误=' + res.msg.last_error;
-        layer.msg(msg, { icon: res.msg.running ? 1 : 0, time: 5000 });
+        showToast(msg, !res.msg.running, 5000);
         refreshList();
       });
     });
     $('.mms-root').off('click', '.source-diagnose').on('click', '.source-diagnose', function () {
       api('diagnose_source', { source_id: $(this).data('id') }, function (res) {
-        if (!res.status) return layer.msg(res.msg || '诊断失败', { icon: 2 });
+        if (!res.status) return showToast(res.text || '诊断失败', true);
         var d = res.msg;
         var tips = (d.suggestions || []).join('\n- ');
-        layer.open({
-          type: 1,
-          area: ['760px', '420px'],
-          title: '诊断结果 - ' + d.source_id,
-          content: '<div style="padding:12px;"><pre>channel: ' + d.channel_name +
-            '\nnetwork_ok: ' + d.network_ok +
-            '\ngtid_enabled: ' + d.gtid_enabled +
-            '\nstatus: ' + JSON.stringify(d.status, null, 2) +
-            '\n建议:\n- ' + tips + '</pre></div>'
-        });
+        var txt = 'channel: ' + safeText(d.channel_name, '-') +
+          '\nnetwork_ok: ' + d.network_ok +
+          '\ngtid_enabled: ' + d.gtid_enabled +
+          '\nstatus: ' + JSON.stringify(d.status, null, 2) +
+          '\n建议:\n- ' + tips;
+        openTextDialog('诊断结果 - ' + safeText(d.source_id, '-'), txt, ['760px', '420px']);
       });
     });
     $('.mms-root').off('click', '.source-log').on('click', '.source-log', function () {
       api('get_source_logs', { source_id: $(this).data('id') }, function (res) {
-        if (!res.status) return layer.msg(res.msg || '日志获取失败', { icon: 2 });
-        layer.open({
-          type: 1,
-          area: ['760px', '420px'],
-          title: '来源日志',
-          content: '<div style="padding:12px;"><pre style="max-height:360px;overflow:auto;">' + (res.msg || '暂无日志') + '</pre></div>'
-        });
+        if (!res.status) return showToast(res.text || '日志获取失败', true);
+        openTextDialog('来源日志', res.msg || '暂无日志', ['760px', '420px']);
       });
     });
 
@@ -949,7 +1019,8 @@
         msg: '确认删除来源: ' + sourceId + ' ?'
       }, function () {
         api('remove_source', { source_id: sourceId }, function (res) {
-          if (!res.status) return layer.msg(res.msg || '删除失败', { icon: 2 });
+          if (!res.status) return showToast(res.text || '删除失败', true);
+          showToast('来源已删除', false);
           refreshList();
         });
       });

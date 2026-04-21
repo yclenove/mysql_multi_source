@@ -43,6 +43,22 @@ class mysql_multi_source_main:
     def _validate_channel_name(self, channel_name):
         return re.match(r"^[A-Za-z0-9_]{1,64}$", channel_name or "") is not None
 
+    def _validate_source_id(self, source_id):
+        return re.match(r"^[A-Za-z0-9_\\-]{1,64}$", source_id or "") is not None
+
+    def _ok(self, data=None, message="ok", code="OK"):
+        payload = data if data is not None else {}
+        if isinstance(payload, dict):
+            payload.setdefault("message", message)
+            payload.setdefault("code", code)
+        return public.returnMsg(True, payload)
+
+    def _fail(self, message, code="ERR_GENERIC", data=None):
+        payload = {"message": str(message), "code": code}
+        if isinstance(data, dict):
+            payload.update(data)
+        return public.returnMsg(False, payload)
+
     def _exec_sql(self, sql):
         mysql_obj = self._mysql()
         return mysql_obj.execute(sql)
@@ -894,22 +910,31 @@ class mysql_multi_source_main:
         ]
         for key in required:
             if not hasattr(get, key) or not str(get.__getattribute__(key)).strip():
-                return public.returnMsg(False, "missing parameter: {}".format(key))
+                return self._fail("missing parameter: {}".format(key), "ERR_PARAM_REQUIRED")
+        source_id = str(get.source_id).strip()
+        if not self._validate_source_id(source_id):
+            return self._fail("source_id 仅支持字母、数字、下划线、中划线，最长64位", "ERR_PARAM_INVALID")
         if not self._validate_channel_name(str(get.channel_name).strip()):
-            return public.returnMsg(False, "channel_name 仅支持字母、数字、下划线，最长64位")
+            return self._fail("channel_name 仅支持字母、数字、下划线，最长64位", "ERR_PARAM_INVALID")
+        try:
+            master_port = int(get.master_port)
+        except Exception:
+            return self._fail("master_port must be integer", "ERR_PARAM_INVALID")
+        if master_port < 1 or master_port > 65535:
+            return self._fail("master_port out of range(1-65535)", "ERR_PARAM_INVALID")
 
         data = self._load_config()
-        if self._find_source(data, get.source_id):
-            return public.returnMsg(False, "source_id already exists")
+        if self._find_source(data, source_id):
+            return self._fail("source_id already exists", "ERR_DUPLICATE")
         for source in data.get("sources", []):
             if source.get("channel_name") == str(get.channel_name).strip():
-                return public.returnMsg(False, "channel_name already exists")
+                return self._fail("channel_name already exists", "ERR_DUPLICATE")
 
         source = {
-            "source_id": str(get.source_id).strip(),
+            "source_id": source_id,
             "channel_name": str(get.channel_name).strip(),
             "master_host": str(get.master_host).strip(),
-            "master_port": int(get.master_port),
+            "master_port": master_port,
             "repl_user": str(get.repl_user).strip(),
             "repl_password": str(get.repl_password).strip(),
             "sync_mode": "gtid",
@@ -929,8 +954,8 @@ class mysql_multi_source_main:
         self._append_log(source["source_id"], "添加主库来源成功，channel={}".format(source["channel_name"]))
 
         if not self._save_config(data):
-            return public.returnMsg(False, "save config failed")
-        return public.returnMsg(True, "来源添加成功")
+            return self._fail("save config failed", "ERR_SAVE_CONFIG")
+        return self._ok({"source_id": source_id}, "来源添加成功")
 
     def test_source_connection(self, get):
         if not hasattr(get, "source_id"):
@@ -991,38 +1016,38 @@ class mysql_multi_source_main:
 
     def set_db_mappings(self, get):
         if not hasattr(get, "source_id"):
-            return public.returnMsg(False, "missing parameter: source_id")
+            return self._fail("missing parameter: source_id", "ERR_PARAM_REQUIRED")
         if not hasattr(get, "mappings"):
-            return public.returnMsg(False, "missing parameter: mappings")
+            return self._fail("missing parameter: mappings", "ERR_PARAM_REQUIRED")
 
         data = self._load_config()
         item = self._find_source(data, str(get.source_id).strip())
         if not item:
-            return public.returnMsg(False, "source not found")
+            return self._fail("source not found", "ERR_NOT_FOUND")
 
         try:
             mappings = get.mappings
             if isinstance(mappings, str):
                 mappings = json.loads(mappings)
             if not isinstance(mappings, list):
-                return public.returnMsg(False, "mappings must be a list")
+                return self._fail("mappings must be a list", "ERR_PARAM_INVALID")
 
             normalized = []
             for m in mappings:
                 if not isinstance(m, dict):
-                    return public.returnMsg(False, "mapping item must be object")
+                    return self._fail("mapping item must be object", "ERR_PARAM_INVALID")
                 source_db = str(m.get("source_db", "")).strip()
                 target_db = str(m.get("target_db", "")).strip()
                 if not source_db or not target_db:
-                    return public.returnMsg(False, "source_db and target_db are required")
+                    return self._fail("source_db and target_db are required", "ERR_PARAM_REQUIRED")
                 normalized.append({"source_db": source_db, "target_db": target_db})
             item["db_mappings"] = normalized
             item["updated_at"] = self._now()
             self._append_log(item["source_id"], "更新库映射，共{}条".format(len(normalized)))
             self._save_config(data)
-            return public.returnMsg(True, "库映射更新成功")
+            return self._ok({"source_id": item.get("source_id"), "count": len(normalized)}, "库映射更新成功")
         except Exception as ex:
-            return public.returnMsg(False, "mappings parse failed: {}".format(ex))
+            return self._fail("mappings parse failed: {}".format(ex), "ERR_PARSE_MAPPINGS")
 
     def list_db_mappings(self, get):
         if not hasattr(get, "source_id"):
@@ -1143,19 +1168,19 @@ class mysql_multi_source_main:
 
     def create_bootstrap_task(self, get):
         if not hasattr(get, "source_id"):
-            return public.returnMsg(False, "missing parameter: source_id")
+            return self._fail("missing parameter: source_id", "ERR_PARAM_REQUIRED")
         mode = "auto"
         if hasattr(get, "mode") and str(get.mode).strip():
             mode = str(get.mode).strip()
         if mode not in ["auto", "physical", "logical"]:
-            return public.returnMsg(False, "mode must be auto/physical/logical")
+            return self._fail("mode must be auto/physical/logical", "ERR_PARAM_INVALID")
 
         data = self._load_config()
         source = self._find_source(data, str(get.source_id).strip())
         if not source:
-            return public.returnMsg(False, "source not found")
+            return self._fail("source not found", "ERR_NOT_FOUND")
         if not source.get("db_mappings"):
-            return public.returnMsg(False, "请先配置库映射后再创建初始化任务")
+            return self._fail("请先配置库映射后再创建初始化任务", "ERR_MAPPINGS_EMPTY")
 
         task_id = "boot_" + uuid.uuid4().hex[:12]
         task = {
@@ -1189,7 +1214,7 @@ class mysql_multi_source_main:
         data["bootstrap_tasks"].insert(0, task)
         self._save_config(data)
         self._append_log(source.get("source_id"), "创建初始化任务: {}, mode={}".format(task_id, mode))
-        return public.returnMsg(True, task)
+        return self._ok(task, "任务创建成功")
 
     def run_bootstrap_task(self, get):
         if not hasattr(get, "task_id"):
@@ -1290,17 +1315,17 @@ class mysql_multi_source_main:
 
     def trigger_bootstrap_task(self, get):
         if not hasattr(get, "task_id"):
-            return public.returnMsg(False, "missing parameter: task_id")
+            return self._fail("missing parameter: task_id", "ERR_PARAM_REQUIRED")
         task_id = str(get.task_id).strip()
 
         data = self._load_config()
         task = self._find_bootstrap_task(data, task_id)
         if not task:
-            return public.returnMsg(False, "task not found")
+            return self._fail("task not found", "ERR_NOT_FOUND")
         if task.get("status") == "running":
-            return public.returnMsg(False, "任务正在执行中")
+            return self._fail("任务正在执行中", "ERR_TASK_RUNNING")
         if task.get("status") == "done":
-            return public.returnMsg(False, "任务已完成，若需重跑请新建任务")
+            return self._fail("任务已完成，若需重跑请新建任务", "ERR_TASK_DONE")
 
         worker_id = "worker_" + uuid.uuid4().hex[:8]
         task["worker_id"] = worker_id
@@ -1312,7 +1337,7 @@ class mysql_multi_source_main:
         )
         public.ExecShell(cmd)
         self._append_log(task.get("source_id"), "异步触发初始化任务: {} by {}".format(task_id, worker_id))
-        return public.returnMsg(True, "已触发后台执行")
+        return self._ok({"task_id": task_id, "worker_id": worker_id}, "已触发后台执行")
 
     def get_bootstrap_tasks(self, get=None):
         data = self._load_config()
