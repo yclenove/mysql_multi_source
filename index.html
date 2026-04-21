@@ -191,6 +191,27 @@
     cursor: pointer;
     color: #2563eb;
   }
+  .mms-root .mms-landing {
+    border: 1px solid #dbeafe;
+    background: #f8fbff;
+    border-radius: 10px;
+    padding: 16px;
+    margin-bottom: 12px;
+  }
+  .mms-root .mms-landing-title {
+    font-size: 16px;
+    font-weight: 600;
+    color: #1e293b;
+    margin-bottom: 6px;
+  }
+  .mms-root .mms-landing-desc {
+    font-size: 13px;
+    color: #475569;
+    margin-bottom: 12px;
+  }
+  .mms-root .is-hidden {
+    display: none !important;
+  }
   .mms-root .mms-tab-pane[hidden],
   .mms-root .mms-tab-pane.is-hidden {
     display: none !important;
@@ -236,7 +257,16 @@
         <button class="btn btn-default btn-sm" id="btn-force-master">我是主机</button>
       </div>
     </div>
-    <div class="mms-steps">
+    <div id="mms_landing" class="mms-landing">
+      <div class="mms-landing-title">先从向导开始</div>
+      <div id="mms_landing_desc" class="mms-landing-desc">默认新手模式：只显示当前步骤必须操作，避免一上来看到过多按钮。</div>
+      <div class="mms-toolbar">
+        <button class="btn btn-success btn-sm" id="btn-start-wizard">开始向导</button>
+        <button class="btn btn-default btn-sm" id="btn-enter-expert">进入专家模式</button>
+        <button class="btn btn-default btn-sm is-hidden" id="btn-enter-novice">返回新手模式</button>
+      </div>
+    </div>
+    <div id="mms_steps_tip" class="mms-steps">
       <span class="mms-step-link" data-jump-tab="1">1. 快速接入来源</span>
       <span>-></span>
       <span class="mms-step-link" data-jump-tab="1">2. 保存库映射</span>
@@ -480,7 +510,10 @@
       latestReq: {},
       activeMode: 'unknown',
       suggestedMode: 'replica_mode',
-      guideVisible: true
+      guideVisible: true,
+      uiMode: 'novice',
+      wizardStarted: false,
+      wizardStep: 1
     };
     var identityModeLabels = {
       master_mode: '主机视角',
@@ -618,6 +651,80 @@
       } catch (e) {}
     }
 
+    function tabByStep(step) {
+      if (state.activeMode === 'master_mode') return 3;
+      if (step <= 2) return 1;
+      if (step === 3) return 2;
+      return 0;
+    }
+
+    function setWizardStep(step) {
+      var s = parseInt(step, 10);
+      if (isNaN(s) || s < 1) s = 1;
+      if (s > 4) s = 4;
+      state.wizardStep = s;
+      renderUiMode();
+    }
+
+    function hideAllPanes() {
+      $('.mms-tab-pane').addClass('is-hidden');
+      $('.bt-w-main .bt-w-menu .bgw').removeClass('on active');
+    }
+
+    function applyStepGuard() {
+      if (state.uiMode !== 'novice' || !state.wizardStarted) {
+        $('.mms-root .btn').show();
+        return;
+      }
+      $('.mms-root .btn').show();
+      var step = state.wizardStep;
+      if (state.activeMode === 'master_mode') {
+        $('#btn-master-health,#btn-master-preview,#btn-master-fix,#btn-master-restart,#btn-master-create-user').show();
+        $('#btn-audit-logs,#btn-snapshots,#btn-export-profile,#btn-import-profile,#btn-verify-profile,#btn-create-handshake,#btn-accept-handshake,#btn-handshake-status').hide();
+        return;
+      }
+      if (step === 1) {
+        $('#btn-add,#btn-master-connect-test,#btn-load-mapping,#btn-add-mapping-row,#btn-set-mapping').show();
+        $('#btn-create-boot,#btn-run-boot,#btn-cancel-boot,#btn-task-detail,#btn-task-log,#btn-list-boot,#btn-health,#btn-refresh,#btn-overview,#btn-gtid,#btn-check-tools').hide();
+      } else if (step === 2) {
+        $('#btn-load-mapping,#btn-add-mapping-row,#btn-set-mapping').show();
+        $('#btn-add,#btn-master-connect-test,#btn-create-boot,#btn-run-boot,#btn-cancel-boot,#btn-task-detail,#btn-task-log,#btn-list-boot,#btn-health,#btn-refresh,#btn-overview,#btn-gtid,#btn-check-tools').hide();
+      } else if (step === 3) {
+        $('#btn-create-boot,#btn-run-boot,#btn-task-detail,#btn-task-log').show();
+        $('#btn-add,#btn-master-connect-test,#btn-load-mapping,#btn-add-mapping-row,#btn-set-mapping,#btn-cancel-boot,#btn-list-boot,#btn-health,#btn-refresh,#btn-overview,#btn-gtid,#btn-check-tools').hide();
+      } else {
+        $('#btn-health,#btn-refresh,#btn-overview,#btn-gtid,#btn-check-tools').show();
+        $('#btn-add,#btn-master-connect-test,#btn-load-mapping,#btn-add-mapping-row,#btn-set-mapping,#btn-create-boot,#btn-run-boot,#btn-cancel-boot,#btn-task-detail,#btn-task-log,#btn-list-boot').hide();
+      }
+    }
+
+    function renderUiMode() {
+      var novice = state.uiMode === 'novice';
+      $('#btn-enter-expert').toggleClass('is-hidden', !novice);
+      $('#btn-enter-novice').toggleClass('is-hidden', novice);
+      if (!novice) {
+        $('.bt-w-main .bt-w-menu').show();
+        $('#mms_steps_tip').removeClass('is-hidden');
+        $('#mms_landing').addClass('is-hidden');
+        mmsSetTab(tabByStep(state.wizardStep));
+        applyStepGuard();
+        return;
+      }
+      $('.bt-w-main .bt-w-menu').hide();
+      if (!state.wizardStarted) {
+        hideAllPanes();
+        $('#mms_steps_tip').addClass('is-hidden');
+        $('#mms_landing').removeClass('is-hidden');
+        showResult('新手模式：先点击“开始向导”，系统会按步骤引导你完成。', false);
+        return;
+      }
+      $('#mms_landing').addClass('is-hidden');
+      $('#mms_steps_tip').removeClass('is-hidden');
+      mmsSetTab(tabByStep(state.wizardStep));
+      applyStepGuard();
+      showResult('当前步骤：' + state.wizardStep + '/4，请按引导完成后进入下一步。', false);
+    }
+
     function applyMenuByMode(mode) {
       state.activeMode = mode || 'unknown';
       var visible = getVisibleTabs();
@@ -631,6 +738,11 @@
       } catch (e) {}
       mmsSetTab(saved == null ? visible[0] : saved);
       $('#mms_rolebar_text').text('当前身份：' + (identityModeLabels[state.activeMode] || '未确认'));
+      if (state.activeMode === 'master_mode') {
+        state.wizardStep = 4;
+      } else if (state.wizardStep === 4 && state.activeMode !== 'master_mode') {
+        state.wizardStep = 1;
+      }
     }
 
     function showIdentityGuide(show, hint) {
@@ -674,6 +786,7 @@
       if (target === 'unknown') {
         applyMenuByMode('unknown');
         updateRoleGuard();
+        renderUiMode();
         return;
       }
       api('set_running_mode', { mode: target }, { singleFlight: true }, function (res) {
@@ -683,6 +796,7 @@
         }
         applyMenuByMode(target);
         updateRoleGuard();
+        renderUiMode();
         showToast('已切换到' + (identityModeLabels[target] || target) + (sourceText ? '（' + sourceText + '）' : ''), false);
       });
     }
@@ -696,6 +810,11 @@
           if (mode === 'unknown') applyMenuByMode('unknown');
           updateRoleGuard();
           showIdentityGuide(true, '检测建议：' + (identityModeLabels[suggested] || suggested) + '。请选择身份后开始操作。');
+          try {
+            var savedMode = sessionStorage.getItem('mms_ui_mode');
+            if (savedMode === 'expert') state.uiMode = 'expert';
+          } catch (e) {}
+          renderUiMode();
         });
       });
     }
@@ -976,6 +1095,7 @@
       api('add_source', data, function (res) {
         if (!res.status) return showToast(res.text || '添加失败', true);
         showToast('添加成功', false);
+        setWizardStep(2);
         refreshList();
       });
     });
@@ -988,6 +1108,7 @@
       api('set_db_mappings', { source_id: sourceId, mappings: JSON.stringify(list) }, function (res) {
         if (!res.status) return showToast(res.text || '映射保存失败', true);
         showToast('映射已保存', false);
+        setWizardStep(3);
         updateFlowGuard();
       });
     });
@@ -1067,6 +1188,7 @@
         api('trigger_bootstrap_task', { task_id: taskId }, function (res) {
           if (!res.status) return showToast(res.text || '触发失败', true);
           showToast('已后台执行', false);
+          setWizardStep(4);
         });
       });
     });
@@ -1222,6 +1344,7 @@
       applyMenuByMode(state.activeMode === 'unknown' ? 'replica_mode' : state.activeMode);
       updateRoleGuard();
       showToast('已跳过身份引导，你可随时在顶部切换', false);
+      renderUiMode();
     });
     $('#btn-force-replica, #btn-switch-replica').on('click', function () {
       showIdentityGuide(false);
@@ -1235,6 +1358,25 @@
       detectAndSuggestRole(function () {
         showIdentityGuide(true);
       });
+    });
+    $('#btn-start-wizard').on('click', function () {
+      state.wizardStarted = true;
+      setWizardStep(state.activeMode === 'master_mode' ? 4 : 1);
+      renderUiMode();
+    });
+    $('#btn-enter-expert').on('click', function () {
+      state.uiMode = 'expert';
+      state.wizardStarted = true;
+      try { sessionStorage.setItem('mms_ui_mode', 'expert'); } catch (e) {}
+      renderUiMode();
+      showToast('已进入专家模式，显示完整操作。', false);
+    });
+    $('#btn-enter-novice').on('click', function () {
+      state.uiMode = 'novice';
+      state.wizardStarted = true;
+      try { sessionStorage.setItem('mms_ui_mode', 'novice'); } catch (e) {}
+      renderUiMode();
+      showToast('已切回新手模式。', false);
     });
 
     mmsInitTab();
