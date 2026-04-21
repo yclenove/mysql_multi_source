@@ -14,105 +14,168 @@ import { scrollPluginTop } from '@/utils/scroll'
 
 const env = useEnvStore()
 
-// --- Scroll helpers: find the actual scroll container (BaoTa wraps the
-// plugin inside several scrollable ancestors: .soft-Body / .plugin_body /
-// .layui-layer-content). We locate the one that's actually scrolling and
-// track its scroll position so we can show a draggable floating indicator.
+// --- Scroll helpers ---------------------------------------------------------
+// BaoTa serves the plugin in an iframe. In most cases the scroll happens on
+// the iframe's window (document.documentElement), but occasionally a layer
+// wrapper (.plugin_body / .layui-layer-content) is the real scroller. We
+// support both: prefer window, fall back to the largest overflowing element.
+type ScrollKind = 'window' | 'element'
 const showFabs = ref(false)
 const scrollPct = ref(0)
-let scrollTarget: HTMLElement | null = null
-let scrollListener: (() => void) | null = null
+let scrollKind: ScrollKind = 'window'
+let scrollEl: HTMLElement | null = null
+let pollTimer: any = null
 
-function findScrollContainer(): HTMLElement | null {
-  const candidates = [
-    document.querySelector('.mms-app'),
-    document.scrollingElement as HTMLElement | null,
-    document.body,
-  ].filter(Boolean) as HTMLElement[]
-  // Walk from .mms-app up to find the first ancestor whose scrollHeight > clientHeight.
+function getScrollMetrics(): { top: number; height: number; client: number } {
+  if (scrollKind === 'window') {
+    const doc = document.scrollingElement || document.documentElement
+    return {
+      top: window.scrollY || doc.scrollTop || 0,
+      height: doc.scrollHeight,
+      client: window.innerHeight || doc.clientHeight,
+    }
+  }
+  const el = scrollEl!
+  return { top: el.scrollTop, height: el.scrollHeight, client: el.clientHeight }
+}
+
+function findInnerScrollEl(): HTMLElement | null {
+  // Walk from .mms-app up and look for any overflowing ancestor; also check
+  // a few well-known BaoTa wrappers by class name in the current document.
+  const checklist: HTMLElement[] = []
   let el: HTMLElement | null = document.querySelector('.mms-app') as HTMLElement | null
   while (el) {
-    const style = getComputedStyle(el)
-    const oy = style.overflowY
-    if ((oy === 'auto' || oy === 'scroll') && el.scrollHeight - el.clientHeight > 10) {
-      return el
-    }
+    checklist.push(el)
     el = el.parentElement
   }
-  // Try parent window (BaoTa iframe layer wrappers)
-  try {
-    const pw = window.parent
-    if (pw && pw !== window) {
-      const layerContent = pw.document.querySelector('.layui-layer-content, .plugin_body, .soft-Body') as HTMLElement | null
-      if (layerContent && layerContent.scrollHeight - layerContent.clientHeight > 10) return layerContent
+  const extras = Array.from(
+    document.querySelectorAll('.plugin_body, .layui-layer-content, .soft-Body')
+  ) as HTMLElement[]
+  checklist.push(...extras)
+  let best: HTMLElement | null = null
+  let bestDiff = 0
+  for (const c of checklist) {
+    const diff = c.scrollHeight - c.clientHeight
+    if (diff > bestDiff + 10) {
+      best = c
+      bestDiff = diff
     }
-  } catch { /* cross-origin, ignore */ }
-  // Fallback to candidates
-  for (const c of candidates) {
-    if (c && c.scrollHeight - c.clientHeight > 10) return c
   }
-  return null
+  return best
+}
+
+function pickScrollTarget() {
+  const doc = document.scrollingElement || document.documentElement
+  const winOverflow = doc.scrollHeight - (window.innerHeight || doc.clientHeight)
+  if (winOverflow > 10) {
+    scrollKind = 'window'
+    scrollEl = null
+    return
+  }
+  const inner = findInnerScrollEl()
+  if (inner && inner.scrollHeight - inner.clientHeight > 10) {
+    scrollKind = 'element'
+    scrollEl = inner
+    return
+  }
+  // default to window even if not overflowing now; will hide fab
+  scrollKind = 'window'
+  scrollEl = null
 }
 
 function updateScrollPct() {
-  if (!scrollTarget) return
-  const max = scrollTarget.scrollHeight - scrollTarget.clientHeight
-  if (max <= 0) {
-    scrollPct.value = 0
+  const m = getScrollMetrics()
+  const max = m.height - m.client
+  if (max <= 10) {
     showFabs.value = false
+    scrollPct.value = 0
     return
   }
-  scrollPct.value = Math.min(100, Math.max(0, Math.round((scrollTarget.scrollTop / max) * 100)))
-  showFabs.value = scrollTarget.scrollHeight > scrollTarget.clientHeight + 80
+  scrollPct.value = Math.min(100, Math.max(0, Math.round((m.top / max) * 100)))
+  showFabs.value = true
 }
 
 function attachScroll() {
   detachScroll()
-  scrollTarget = findScrollContainer()
-  if (!scrollTarget) return
-  scrollListener = () => updateScrollPct()
-  scrollTarget.addEventListener('scroll', scrollListener, { passive: true })
+  pickScrollTarget()
+  if (scrollKind === 'window') {
+    window.addEventListener('scroll', updateScrollPct, { passive: true })
+    window.addEventListener('resize', updateScrollPct, { passive: true })
+  } else if (scrollEl) {
+    scrollEl.addEventListener('scroll', updateScrollPct, { passive: true })
+  }
+  // Also poll every 1.5s to re-detect target when content grows (e.g. log
+  // panels appearing) or the best scroller changes.
+  if (!pollTimer) {
+    pollTimer = setInterval(() => {
+      const prevKind = scrollKind
+      const prevEl = scrollEl
+      pickScrollTarget()
+      if (prevKind !== scrollKind || prevEl !== scrollEl) {
+        // rebind listeners
+        if (prevKind === 'window') {
+          window.removeEventListener('scroll', updateScrollPct)
+          window.removeEventListener('resize', updateScrollPct)
+        } else if (prevEl) {
+          prevEl.removeEventListener('scroll', updateScrollPct)
+        }
+        if (scrollKind === 'window') {
+          window.addEventListener('scroll', updateScrollPct, { passive: true })
+          window.addEventListener('resize', updateScrollPct, { passive: true })
+        } else if (scrollEl) {
+          scrollEl.addEventListener('scroll', updateScrollPct, { passive: true })
+        }
+      }
+      updateScrollPct()
+    }, 1500)
+  }
   updateScrollPct()
 }
 
 function detachScroll() {
-  if (scrollTarget && scrollListener) {
-    scrollTarget.removeEventListener('scroll', scrollListener)
+  window.removeEventListener('scroll', updateScrollPct)
+  window.removeEventListener('resize', updateScrollPct)
+  if (scrollEl) scrollEl.removeEventListener('scroll', updateScrollPct)
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
   }
-  scrollTarget = null
-  scrollListener = null
+}
+
+function doScrollTo(top: number, smooth = true) {
+  const opts: ScrollToOptions = { top, behavior: smooth ? 'smooth' : 'auto' }
+  if (scrollKind === 'window') {
+    window.scrollTo(opts)
+  } else if (scrollEl) {
+    scrollEl.scrollTo(opts)
+  }
 }
 
 function scrollToTop() {
-  if (!scrollTarget) attachScroll()
-  scrollTarget?.scrollTo({ top: 0, behavior: 'smooth' })
+  doScrollTo(0)
 }
 
 function scrollToBottom() {
-  if (!scrollTarget) attachScroll()
-  if (!scrollTarget) return
-  scrollTarget.scrollTo({ top: scrollTarget.scrollHeight, behavior: 'smooth' })
+  const m = getScrollMetrics()
+  doScrollTo(m.height)
 }
 
 function jumpToTrack(evt: MouseEvent) {
-  if (!scrollTarget) attachScroll()
-  if (!scrollTarget) return
   const track = evt.currentTarget as HTMLElement
   const rect = track.getBoundingClientRect()
   const ratio = Math.min(1, Math.max(0, (evt.clientY - rect.top) / rect.height))
-  const max = scrollTarget.scrollHeight - scrollTarget.clientHeight
-  scrollTarget.scrollTo({ top: max * ratio, behavior: 'smooth' })
+  const m = getScrollMetrics()
+  doScrollTo((m.height - m.client) * ratio)
 }
 
 function dragTrack(evt: MouseEvent) {
-  if (!scrollTarget) attachScroll()
-  if (!scrollTarget) return
   const track = evt.currentTarget as HTMLElement
   const rect = track.getBoundingClientRect()
-  const max = scrollTarget.scrollHeight - scrollTarget.clientHeight
+  const m0 = getScrollMetrics()
+  const max = m0.height - m0.client
   const onMove = (e: MouseEvent) => {
     const ratio = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height))
-    scrollTarget!.scrollTop = max * ratio
+    doScrollTo(max * ratio, false)
   }
   const onUp = () => {
     window.removeEventListener('mousemove', onMove)
@@ -265,34 +328,37 @@ html,
 /* Floating up / down / progress indicator on the right edge */
 .mms-scroll-fab {
   position: fixed;
-  right: 16px;
+  right: 12px;
   top: 50%;
   transform: translateY(-50%);
-  z-index: 9999;
+  z-index: 2147483000; /* max-ish, above BaoTa overlays */
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 6px;
   padding: 8px 6px;
-  background: rgba(255, 255, 255, 0.92);
+  background: rgba(255, 255, 255, 0.95);
   border: 1px solid rgba(0, 0, 0, 0.08);
-  border-radius: 20px;
-  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.1);
+  border-radius: 22px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.14);
   backdrop-filter: blur(6px);
+  pointer-events: auto;
 }
 .mms-scroll-fab__track {
-  width: 4px;
-  height: 120px;
+  width: 6px;
+  height: 140px;
   background: #eef0f4;
-  border-radius: 2px;
+  border-radius: 3px;
   overflow: hidden;
   margin: 4px 0;
   cursor: pointer;
+  position: relative;
 }
 .mms-scroll-fab__thumb {
   width: 100%;
   background: linear-gradient(180deg, #4098fc 0%, #2080f0 100%);
-  border-radius: 2px;
-  transition: height 0.15s ease;
+  border-radius: 3px;
+  transition: height 0.12s ease;
+  min-height: 18px;
 }
 </style>
