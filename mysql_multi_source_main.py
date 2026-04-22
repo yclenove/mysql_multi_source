@@ -870,6 +870,24 @@ class mysql_multi_source_main:
         hb_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
         hb_thread.start()
 
+        # Capture master GTID executed position BEFORE the first dump so that
+        # we can later SET @@GLOBAL.gtid_purged and START SLAVE without the
+        # replica trying to re-apply historical events. Best-effort: if the
+        # capture fails we continue, but replication will likely need manual
+        # catchup later.
+        try:
+            captured_gtid = self._query_master_gtid_executed(source_host, source_port, source_user, source_pwd)
+            if captured_gtid is not None:
+                task["master_gtid_at_dump"] = captured_gtid
+                self._append_task_log(
+                    task_id,
+                    "[gtid] 主库 gtid_executed 捕获完成: {}".format(captured_gtid or "(空)"),
+                )
+            else:
+                self._append_task_log(task_id, "[gtid] 未能从主库读取 gtid_executed，稍后启动通道可能遇到追数异常")
+        except Exception as ex:
+            self._append_task_log(task_id, "[gtid] 捕获失败: {}".format(ex))
+
         try:
             return self._run_logical_bootstrap_core(
                 source, task, mappings, source_host, source_port, source_user, source_pwd,
@@ -877,6 +895,42 @@ class mysql_multi_source_main:
             )
         finally:
             hb_stop.set()
+
+    def _query_master_gtid_executed(self, host, port, user, pwd):
+        """Return master's @@GLOBAL.gtid_executed (possibly empty string) or None on error.
+
+        Uses the mysql CLI so we don't depend on pymysql/MySQLdb being importable
+        from the plugin context; password is passed via MYSQL_PWD env to avoid
+        argv leakage.
+        """
+        try:
+            cmd = [
+                "mysql",
+                "--host=" + str(host),
+                "--port=" + str(int(port)),
+                "--user=" + str(user),
+                "--skip-column-names",
+                "--batch",
+                "--connect-timeout=8",
+                "-e", "SELECT @@GLOBAL.gtid_executed",
+            ]
+            env = dict(os.environ, MYSQL_PWD=str(pwd or ""))
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+            try:
+                out, err = p.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                return None
+            if p.returncode != 0:
+                return None
+            val = (out or b"").decode("utf-8", errors="replace").strip()
+            # mysql CLI prints NULL as "NULL" when value is NULL; MySQL should
+            # never return NULL for gtid_executed but handle it just in case.
+            if val.upper() == "NULL":
+                return ""
+            return val
+        except Exception:
+            return None
 
     def _run_logical_bootstrap_core(self, source, task, mappings, source_host, source_port,
                                      source_user, source_pwd, local_root_pwd, task_dir):
@@ -2466,6 +2520,99 @@ class mysql_multi_source_main:
                 self._append_task_log(tid, "cancelled because source {} removed".format(source_id))
         return self._ok({"source_id": source_id}, "来源已删除", "SOURCE_REMOVED")
 
+    def _auto_start_channel_after_bootstrap(self, source, task):
+        """Bring replication online right after the initial data copy finishes.
+
+        Strategy:
+          1. If the task captured master's gtid_executed before mysqldump AND
+             the replica has no replication state yet (fresh box), execute
+             RESET MASTER + SET @@GLOBAL.gtid_purged so MASTER_AUTO_POSITION=1
+             will not try to re-apply the historical rows we already dumped.
+             Important: RESET MASTER is global; we only run it when gtid_executed
+             is empty so we never disrupt existing multi-source channels.
+          2. Always run CHANGE MASTER TO + START SLAVE for the channel.
+          3. Refresh source.status from SHOW SLAVE STATUS so the dashboard
+             immediately reflects io_running / sql_running.
+        """
+        source_id = source.get("source_id")
+        channel_name = source.get("channel_name")
+        task_id = task.get("task_id")
+        if not self._validate_channel_name(channel_name):
+            raise Exception("通道名称无效: {}".format(channel_name))
+
+        safe_channel = self._sql_escape(channel_name)
+        master_host_s = self._sql_escape(source.get("master_host"))
+        master_port = int(source.get("master_port", 3306))
+        repl_user_s = self._sql_escape(source.get("repl_user"))
+        plain_pwd = self._decrypted_password(source)
+        repl_pwd_s = self._sql_escape(plain_pwd)
+
+        captured_gtid = task.get("master_gtid_at_dump")
+        if captured_gtid is not None and str(captured_gtid).strip():
+            current_gtid = ""
+            try:
+                rows = self._query_sql("SELECT @@GLOBAL.gtid_executed")
+                if rows:
+                    first = rows[0]
+                    val = first[0] if not isinstance(first, dict) else list(first.values())[0]
+                    current_gtid = str(val or "").strip()
+            except Exception:
+                current_gtid = ""
+            if not current_gtid:
+                self._append_task_log(
+                    task_id,
+                    "[auto-start] 从库 gtid_executed 为空，执行 RESET MASTER + SET GTID_PURGED='{}'".format(captured_gtid),
+                )
+                try:
+                    self._exec_sql("RESET MASTER")
+                except Exception as ex:
+                    self._append_task_log(task_id, "[auto-start] RESET MASTER 失败（忽略）: {}".format(ex))
+                try:
+                    self._exec_sql("SET @@GLOBAL.gtid_purged = '{}'".format(self._sql_escape(str(captured_gtid))))
+                except Exception as ex:
+                    self._append_task_log(task_id, "[auto-start] SET GTID_PURGED 失败（忽略，可能会出现重复事件）: {}".format(ex))
+            else:
+                self._append_task_log(
+                    task_id,
+                    "[auto-start] 从库已有 gtid_executed，跳过 RESET MASTER；当前: {}".format(current_gtid),
+                )
+        else:
+            self._append_task_log(task_id, "[auto-start] 未捕获主库 GTID，跳过 GTID 对齐（可能出现重复事件）")
+
+        try:
+            self._exec_sql("STOP SLAVE FOR CHANNEL '{}'".format(safe_channel))
+        except Exception:
+            pass
+
+        change_sql = (
+            "CHANGE MASTER TO MASTER_HOST='{host}', MASTER_PORT={port}, "
+            "MASTER_USER='{user}', MASTER_PASSWORD='{pwd}', MASTER_AUTO_POSITION=1 "
+            "FOR CHANNEL '{channel}'"
+        ).format(
+            host=master_host_s,
+            port=master_port,
+            user=repl_user_s,
+            pwd=repl_pwd_s,
+            channel=safe_channel,
+        )
+        self._append_task_log(task_id, "[auto-start] CHANGE MASTER TO ... FOR CHANNEL '{}'".format(channel_name))
+        self._exec_sql(change_sql)
+        self._exec_sql("START SLAVE FOR CHANNEL '{}'".format(safe_channel))
+        self._append_task_log(task_id, "[auto-start] START SLAVE 已发出，开始追数")
+
+        # Refresh dashboard state from SHOW SLAVE STATUS
+        try:
+            status = self._get_source_status(channel_name)
+            data = self._load_config()
+            src_live = self._find_source(data, source_id)
+            if src_live:
+                src_live["status"] = status
+                src_live["updated_at"] = self._now()
+                self._save_config(data)
+        except Exception:
+            pass
+        self._append_log(source_id, "bootstrap 完成后自动启动 channel")
+
     def start_channel(self, get):
         if not hasattr(get, "source_id"):
             return self._fail("缺少参数: source_id", "ERR_PARAM_REQUIRED")
@@ -2688,8 +2835,22 @@ class mysql_multi_source_main:
             time.sleep(0.2)
             self._task_step_update(data, task, "导入目标", 75)
             time.sleep(0.2)
+
+            # --- Take over replication: set GTID if captured, then CHANGE
+            # MASTER + START SLAVE automatically so the user doesn't have to
+            # click "启动通道" after the initial data copy completes. -------
             self._task_step_update(data, task, "校验并接管复制", 90)
-            time.sleep(0.2)
+            channel_start_err = None
+            try:
+                data2 = self._load_config()
+                task2 = self._find_bootstrap_task(data2, task_id) or task
+                source2 = self._find_source(data2, task2.get("source_id"))
+                if source2:
+                    self._auto_start_channel_after_bootstrap(source2, task2)
+                    task = task2
+            except Exception as start_ex:
+                channel_start_err = str(start_ex)
+                self._append_task_log(task_id, "[auto-start] 启动通道失败: {}".format(channel_start_err))
 
             data = self._load_config()
             task = self._find_bootstrap_task(data, task_id)
@@ -2697,8 +2858,10 @@ class mysql_multi_source_main:
                 return public.returnMsg(False, "task not found")
             task["checkpoint_step"] = task.get("steps", [])[step_count - 1]
             task["progress"] = 100
-            task["current_step"] = "初始化完成"
+            task["current_step"] = "初始化完成（复制已启动）" if not channel_start_err else "初始化完成（请手动启动通道）"
             task["status"] = "done"
+            if channel_start_err:
+                task["channel_start_error"] = channel_start_err
             task["finished_at"] = self._now()
             task["duration_seconds"] = max(0, int(task["finished_at"] - int(task.get("started_at", task["finished_at"]))))
             self._heartbeat_task(task)
