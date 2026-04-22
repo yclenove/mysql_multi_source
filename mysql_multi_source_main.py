@@ -27,6 +27,14 @@ import public
 import db_mysql
 
 try:
+    # Used to register the target DB into BaoTa's panel SQLite so it shows up
+    # in the "数据库" list; optional because older BaoTa versions may not
+    # ship this module in the same path.
+    import database as _bt_database
+except Exception:
+    _bt_database = None
+
+try:
     import fcntl as _fcntl
 except Exception:
     _fcntl = None
@@ -633,6 +641,94 @@ class mysql_multi_source_main:
         except Exception:
             return ""
 
+    def _register_db_in_panel(self, db_name, source_id=""):
+        """Ensure BaoTa's panel SQLite knows about ``db_name``.
+
+        BaoTa's "数据库 → MySQL" list only shows databases present in the panel
+        SQLite table ``databases``. Databases created directly via
+        ``CREATE DATABASE`` (like the ones our bootstrap produces) are
+        invisible there, which makes users think the sync isn't real.
+
+        Strategy:
+          * If BaoTa's ``database`` module is available, try its ``SetupDatabase``
+            / ``AddDatabase`` APIs (these fail if the DB already exists, which
+            is fine -- we catch and fall through).
+          * Otherwise (or on failure) write directly into the ``databases``
+            table via ``public.M``, which BaoTa's UI reads from.
+
+        Returns a short human-readable note describing what happened, or ''
+        when the DB was already registered.
+        """
+        if not db_name or not self._validate_mysql_scope_name(db_name):
+            return ""
+        try:
+            existing = public.M("databases").where("name=?", (db_name,)).count()
+            if existing and int(existing) > 0:
+                return ""
+        except Exception:
+            existing = 0
+
+        ps_note = "mysql_multi_source 同步库"
+        if source_id:
+            ps_note += "（源: {}）".format(source_id)
+
+        # --- Path 1: BaoTa's database module (best-effort) ---------------
+        if _bt_database is not None:
+            try:
+                root_pwd = self._get_local_mysql_root_password() or ""
+                get_obj = public.to_dict_obj({
+                    "name": db_name,
+                    "codeing": "utf8mb4",
+                    "db_user": db_name[:32],
+                    "password": root_pwd or "mms_readonly",
+                    "dataAccess": "127.0.0.1",
+                    "sid": "0",
+                    "address": "127.0.0.1",
+                    "ps": ps_note,
+                    "dtype": "MySQL",
+                })
+                db_helper = _bt_database.database()
+                if hasattr(db_helper, "SetupDatabase"):
+                    _ = db_helper.SetupDatabase(get_obj)
+                elif hasattr(db_helper, "AddDatabase"):
+                    _ = db_helper.AddDatabase(get_obj)
+                if public.M("databases").where("name=?", (db_name,)).count():
+                    return "已注册到宝塔数据库列表: {}".format(db_name)
+            except Exception:
+                pass
+
+        # --- Path 2: raw insert into panel SQLite ------------------------
+        try:
+            now_ts = time.strftime("%Y-%m-%d %X", time.localtime())
+            record = {
+                "pid": 0,
+                "name": db_name,
+                "type": "MySQL",
+                "sid": 0,
+                "username": db_name[:32],
+                "password": "",
+                "accept": "127.0.0.1",
+                "ps": ps_note,
+                "addtime": now_ts,
+            }
+            # Some BaoTa schemas include extra columns (e.g. ``quota`` or
+            # ``login_name``). Insert best-effort and fall back to a smaller
+            # record if the insert fails.
+            for trim in [0, 1, 2]:
+                slim = dict(record)
+                if trim >= 1:
+                    slim.pop("ps", None)
+                if trim >= 2:
+                    slim.pop("accept", None)
+                try:
+                    public.M("databases").insert(slim)
+                    return "已写入宝塔数据库列表（最小字段={}）: {}".format(trim, db_name)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return ""
+
     def _resolve_task_mode(self, task_mode):
         mode = str(task_mode or "auto").strip().lower()
         if mode == "physical":
@@ -953,6 +1049,12 @@ class mysql_multi_source_main:
             create_db_sql = "CREATE DATABASE IF NOT EXISTS `{}` CHARACTER SET utf8mb4".format(target_db)
             self._exec_sql(create_db_sql)
             self._append_task_log(task_id, "确认目标库存在: {}".format(target_db))
+            try:
+                reg_note = self._register_db_in_panel(target_db, source_id=source.get("source_id"))
+                if reg_note:
+                    self._append_task_log(task_id, "[panel] " + reg_note)
+            except Exception as ex:
+                self._append_task_log(task_id, "[panel] 注册到宝塔数据库列表失败（不影响同步）: {}".format(ex))
 
             dump_progress = 30 + int((idx / total) * 25)
             self._task_step_update(None, task, "备份 {} ({}/{})".format(source_db, idx + 1, total), dump_progress)
@@ -3668,6 +3770,34 @@ class mysql_multi_source_main:
             "检测到重复接入，已更新配置并继续执行任务" if source_existed else ("已完成接入，任务已开始后台执行" if auto_start else "已完成接入，等待手动触发"),
             "WIZARD_START_OK",
         )
+
+    def register_existing_target_dbs(self, get=None):
+        """Register every known target DB into BaoTa's panel list.
+
+        Useful for sources that finished before the auto-register logic was
+        added. UI calls this from the dashboard's "同步到宝塔数据库列表" button.
+        """
+        data = self._load_config()
+        sources = data.get("sources", []) or []
+        registered = []
+        skipped = []
+        for src in sources:
+            for m in src.get("db_mappings", []) or []:
+                tgt = str(m.get("target_db", "")).strip()
+                if not tgt:
+                    continue
+                try:
+                    note = self._register_db_in_panel(tgt, source_id=src.get("source_id"))
+                    if note:
+                        registered.append({"db": tgt, "note": note})
+                    else:
+                        skipped.append(tgt)
+                except Exception as ex:
+                    skipped.append("{}({})".format(tgt, ex))
+        return public.returnMsg(True, {
+            "registered": registered,
+            "skipped_or_existing": skipped,
+        })
 
     def wizard_dashboard_snapshot(self, get=None):
         """Return per-source status + running tasks with one SHOW SLAVE STATUS."""

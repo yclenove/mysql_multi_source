@@ -7,7 +7,7 @@ import {
 } from 'naive-ui'
 import { PlayOutline, PauseOutline, TrashOutline } from '@vicons/ionicons5'
 import { useDashboardStore, type SourceStatus } from '@/store/dashboard'
-import { call, isOk, btConfirm, getMessage } from '@/api/plugin'
+import { call, isOk, btConfirm, getMessage, extractMsg } from '@/api/plugin'
 import { useEnvStore } from '@/store/env'
 
 const dash = useDashboardStore()
@@ -168,6 +168,27 @@ async function installTool(tool: 'xtrabackup' | 'mariabackup') {
     installLoading.value[tool] = false
   }
 }
+
+const registerPanelLoading = ref(false)
+async function registerPanelDbs() {
+  registerPanelLoading.value = true
+  try {
+    const res = await call('register_existing_target_dbs')
+    if (isOk(res)) {
+      const d = extractMsg(res) || {}
+      const regCount = (d.registered || []).length
+      if (regCount > 0) {
+        msg.success(`已注册 ${regCount} 个同步库到宝塔「数据库」列表，刷新 MySQL 管理页即可看到`)
+      } else {
+        msg.info('所有同步库都已在宝塔「数据库」列表中')
+      }
+    } else {
+      msg.error(getMessage(res) || '注册到宝塔数据库列表失败')
+    }
+  } finally {
+    registerPanelLoading.value = false
+  }
+}
 </script>
 
 <template>
@@ -175,6 +196,10 @@ async function installTool(tool: 'xtrabackup' | 'mariabackup') {
     <div class="mms-dash__header">
       <h2 class="mms-dash__title">复制仪表盘</h2>
       <NSpace :size="6">
+        <NButton size="small" type="primary" ghost :loading="registerPanelLoading" @click="registerPanelDbs"
+                 title="将已同步的目标库写入宝塔「数据库」列表，让面板能看到同步库">
+          同步到面板数据库列表
+        </NButton>
         <NButton size="small" @click="installTool('xtrabackup')" :loading="installLoading.xtrabackup">安装 xtrabackup</NButton>
         <NButton size="small" @click="installTool('mariabackup')" :loading="installLoading.mariabackup">安装 mariabackup</NButton>
         <NButton size="small" @click="dash.refresh">刷新</NButton>
