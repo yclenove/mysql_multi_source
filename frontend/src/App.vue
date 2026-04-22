@@ -15,140 +15,50 @@ import { scrollPluginTop } from '@/utils/scroll'
 const env = useEnvStore()
 
 // --- Scroll helpers ---------------------------------------------------------
-// BaoTa serves the plugin in an iframe. In most cases the scroll happens on
-// the iframe's window (document.documentElement), but occasionally a layer
-// wrapper (.plugin_body / .layui-layer-content) is the real scroller. We
-// support both: prefer window, fall back to the largest overflowing element.
-type ScrollKind = 'window' | 'element'
+// Use an internal scroll container as a hard fallback. This avoids relying on
+// BaoTa modal/iframe outer wrappers, which may hide/clip host scrollbars.
 const showFabs = ref(false)
 const scrollPct = ref(0)
-let scrollKind: ScrollKind = 'window'
-let scrollEl: HTMLElement | null = null
-let pollTimer: any = null
-
-function getScrollMetrics(): { top: number; height: number; client: number } {
-  if (scrollKind === 'window') {
-    const doc = document.scrollingElement || document.documentElement
-    return {
-      top: window.scrollY || doc.scrollTop || 0,
-      height: doc.scrollHeight,
-      client: window.innerHeight || doc.clientHeight,
-    }
-  }
-  const el = scrollEl!
-  return { top: el.scrollTop, height: el.scrollHeight, client: el.clientHeight }
-}
-
-function findInnerScrollEl(): HTMLElement | null {
-  // Walk from .mms-app up and look for any overflowing ancestor; also check
-  // a few well-known BaoTa wrappers by class name in the current document.
-  const checklist: HTMLElement[] = []
-  let el: HTMLElement | null = document.querySelector('.mms-app') as HTMLElement | null
-  while (el) {
-    checklist.push(el)
-    el = el.parentElement
-  }
-  const extras = Array.from(
-    document.querySelectorAll('.plugin_body, .layui-layer-content, .soft-Body')
-  ) as HTMLElement[]
-  checklist.push(...extras)
-  let best: HTMLElement | null = null
-  let bestDiff = 0
-  for (const c of checklist) {
-    const diff = c.scrollHeight - c.clientHeight
-    if (diff > bestDiff + 10) {
-      best = c
-      bestDiff = diff
-    }
-  }
-  return best
-}
-
-function pickScrollTarget() {
-  const doc = document.scrollingElement || document.documentElement
-  const winOverflow = doc.scrollHeight - (window.innerHeight || doc.clientHeight)
-  if (winOverflow > 10) {
-    scrollKind = 'window'
-    scrollEl = null
-    return
-  }
-  const inner = findInnerScrollEl()
-  if (inner && inner.scrollHeight - inner.clientHeight > 10) {
-    scrollKind = 'element'
-    scrollEl = inner
-    return
-  }
-  // default to window even if not overflowing now; will hide fab
-  scrollKind = 'window'
-  scrollEl = null
-}
+const bodyRef = ref<HTMLElement | null>(null)
 
 function updateScrollPct() {
-  const m = getScrollMetrics()
-  const max = m.height - m.client
+  const el = bodyRef.value
+  if (!el) {
+    showFabs.value = false
+    scrollPct.value = 0
+    return
+  }
+  const max = el.scrollHeight - el.clientHeight
   if (max <= 10) {
     showFabs.value = false
     scrollPct.value = 0
     return
   }
-  scrollPct.value = Math.min(100, Math.max(0, Math.round((m.top / max) * 100)))
+  scrollPct.value = Math.min(100, Math.max(0, Math.round((el.scrollTop / max) * 100)))
   showFabs.value = true
 }
 
 function attachScroll() {
   detachScroll()
-  pickScrollTarget()
-  if (scrollKind === 'window') {
-    window.addEventListener('scroll', updateScrollPct, { passive: true })
-    window.addEventListener('resize', updateScrollPct, { passive: true })
-  } else if (scrollEl) {
-    scrollEl.addEventListener('scroll', updateScrollPct, { passive: true })
+  if (bodyRef.value) {
+    bodyRef.value.addEventListener('scroll', updateScrollPct, { passive: true })
   }
-  // Also poll every 1.5s to re-detect target when content grows (e.g. log
-  // panels appearing) or the best scroller changes.
-  if (!pollTimer) {
-    pollTimer = setInterval(() => {
-      const prevKind = scrollKind
-      const prevEl = scrollEl
-      pickScrollTarget()
-      if (prevKind !== scrollKind || prevEl !== scrollEl) {
-        // rebind listeners
-        if (prevKind === 'window') {
-          window.removeEventListener('scroll', updateScrollPct)
-          window.removeEventListener('resize', updateScrollPct)
-        } else if (prevEl) {
-          prevEl.removeEventListener('scroll', updateScrollPct)
-        }
-        if (scrollKind === 'window') {
-          window.addEventListener('scroll', updateScrollPct, { passive: true })
-          window.addEventListener('resize', updateScrollPct, { passive: true })
-        } else if (scrollEl) {
-          scrollEl.addEventListener('scroll', updateScrollPct, { passive: true })
-        }
-      }
-      updateScrollPct()
-    }, 1500)
-  }
+  window.addEventListener('resize', updateScrollPct, { passive: true })
   updateScrollPct()
 }
 
 function detachScroll() {
-  window.removeEventListener('scroll', updateScrollPct)
   window.removeEventListener('resize', updateScrollPct)
-  if (scrollEl) scrollEl.removeEventListener('scroll', updateScrollPct)
-  if (pollTimer) {
-    clearInterval(pollTimer)
-    pollTimer = null
+  if (bodyRef.value) {
+    bodyRef.value.removeEventListener('scroll', updateScrollPct)
   }
 }
 
 function doScrollTo(top: number, smooth = true) {
+  const el = bodyRef.value
+  if (!el) return
   const opts: ScrollToOptions = { top, behavior: smooth ? 'smooth' : 'auto' }
-  if (scrollKind === 'window') {
-    window.scrollTo(opts)
-  } else if (scrollEl) {
-    scrollEl.scrollTo(opts)
-  }
+  el.scrollTo(opts)
 }
 
 function scrollToTop() {
@@ -156,23 +66,26 @@ function scrollToTop() {
 }
 
 function scrollToBottom() {
-  const m = getScrollMetrics()
-  doScrollTo(m.height)
+  const el = bodyRef.value
+  if (!el) return
+  doScrollTo(el.scrollHeight)
 }
 
 function jumpToTrack(evt: MouseEvent) {
   const track = evt.currentTarget as HTMLElement
   const rect = track.getBoundingClientRect()
   const ratio = Math.min(1, Math.max(0, (evt.clientY - rect.top) / rect.height))
-  const m = getScrollMetrics()
-  doScrollTo((m.height - m.client) * ratio)
+  const el = bodyRef.value
+  if (!el) return
+  doScrollTo((el.scrollHeight - el.clientHeight) * ratio)
 }
 
 function dragTrack(evt: MouseEvent) {
   const track = evt.currentTarget as HTMLElement
   const rect = track.getBoundingClientRect()
-  const m0 = getScrollMetrics()
-  const max = m0.height - m0.client
+  const el = bodyRef.value
+  if (!el) return
+  const max = el.scrollHeight - el.clientHeight
   const onMove = (e: MouseEvent) => {
     const ratio = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height))
     doScrollTo(max * ratio, false)
@@ -201,6 +114,7 @@ watch(
   () => {
     nextTick(() => {
       scrollPluginTop()
+      if (bodyRef.value) bodyRef.value.scrollTop = 0
       setTimeout(() => {
         attachScroll()
         updateScrollPct()
@@ -243,7 +157,7 @@ const themeOverrides: GlobalThemeOverrides = {
       <NDialogProvider>
         <div class="mms-app">
           <AppHeader />
-          <div class="mms-body">
+          <div ref="bodyRef" class="mms-body">
             <LandingCards v-if="env.currentView === 'landing'" />
             <WizardMaster v-else-if="env.currentView === 'wizard_master'" />
             <WizardReplica v-else-if="env.currentView === 'wizard_replica'" />
@@ -286,10 +200,20 @@ const themeOverrides: GlobalThemeOverrides = {
   margin: 0 auto;
   padding: 0 20px;
   position: relative;
+  height: 100vh;
+  max-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
 }
 .mms-body {
   padding-top: 16px;
   padding-bottom: 24px;
+  padding-right: 8px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
 /* Force a visible, draggable scrollbar for WebKit browsers. BaoTa's modal
@@ -360,5 +284,14 @@ html,
   border-radius: 3px;
   transition: height 0.12s ease;
   min-height: 18px;
+}
+
+@media (max-width: 768px) {
+  .mms-app {
+    padding: 0 12px;
+  }
+  .mms-scroll-fab {
+    right: 6px;
+  }
 }
 </style>
