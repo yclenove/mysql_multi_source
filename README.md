@@ -257,3 +257,27 @@
 
 - 防止伪造或被篡改的配置单绕过“签名配置文件”链路
 - 避免目标库冲突检查尚未完成时就提前进入下一步
+
+## 阶段二十八：握手留痕与总览查询收敛（已完成）
+
+### 后端
+
+- 握手链路增强：
+  - `master_create_handshake` 新增 `accept_attempts`、`last_error`、`last_error_code`、`last_error_at`、`accepted_at`
+  - `replica_accept_handshake` 在失败时记录错误消息、错误码、失败时间与尝试次数，并写入审计日志
+- 总览性能优化：
+  - `overview_metrics()` 不再逐来源调用 `_get_source_status()`
+  - 改为复用 `_all_slave_status() + _map_status_row()` 一次抓取全部复制状态
+- 任务触发护栏：
+  - `trigger_bootstrap_task()` 对 `cancelled` 任务明确拒绝重触发，要求用户新建任务
+
+### 前端
+
+- 从库向导新增独立的“开始同步中”锁，避免重复点击提交
+- 第 4 步进入第 5 步时，若映射仍无效或存在冲突，继续阻止进入确认页
+
+### 价值
+
+- 握手失败时可回溯失败原因，不再只有笼统的 `failed`
+- 仪表盘总览指标与向导快照使用同一套状态抓取方式，降低 N+1 查询开销
+- 减少向导与任务链路里的重复触发和误重试

@@ -15,6 +15,7 @@ const env = useEnvStore()
 const msg = useMessage()
 const step = ref(1)
 const loading = ref(false)
+const startingReplication = ref(false)
 
 const inputMode = ref<'profile' | 'manual'>('manual')
 const profileText = ref('')
@@ -284,7 +285,9 @@ const finalState = computed<'idle' | 'running' | 'done' | 'failed' | 'cancelled'
 })
 
 async function startReplication() {
+  if (startingReplication.value) return
   if (!(await runConflictCheck(true))) return
+  startingReplication.value = true
   loading.value = true
   syncTaskStatus.value = null
   syncTaskLog.value = ''
@@ -317,6 +320,7 @@ async function startReplication() {
     }
   } finally {
     loading.value = false
+    startingReplication.value = false
   }
 }
 
@@ -655,7 +659,7 @@ const checkLabels: Record<string, string> = { network: '网络连通', auth: '�
 
         <div class="mms-step-actions">
           <NButton @click="step = 3">上一步</NButton>
-          <NButton type="primary" @click="step = 5">下一步：确认同步</NButton>
+          <NButton type="primary" :disabled="hasInvalidTargetDb || hasTargetDbConflicts" @click="step = 5">下一步：确认同步</NButton>
         </div>
       </div>
 
@@ -698,7 +702,7 @@ const checkLabels: Record<string, string> = { network: '网络连通', auth: '�
 
         <div class="mms-step-actions">
           <NButton @click="step = 4">上一步</NButton>
-          <NButton type="primary" size="large" :loading="loading" :disabled="hasInvalidTargetDb || hasTargetDbConflicts" @click="startReplication">
+          <NButton type="primary" size="large" :loading="startingReplication" :disabled="loading || startingReplication || hasInvalidTargetDb || hasTargetDbConflicts" @click="startReplication">
             开始同步
           </NButton>
         </div>

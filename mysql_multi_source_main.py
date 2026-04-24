@@ -2521,6 +2521,11 @@ class mysql_multi_source_main:
             "created_at": self._now(),
             "expires_at": self._now() + ttl,
             "consumed": False,
+            "accept_attempts": 0,
+            "last_error": "",
+            "last_error_code": "",
+            "last_error_at": 0,
+            "accepted_at": 0,
         }
         data.setdefault("handshake_sessions", []).insert(0, session)
         self._audit(data, "master_create_handshake", {"token": token, "expires_at": session["expires_at"]})
@@ -2543,10 +2548,32 @@ class mysql_multi_source_main:
             return public.returnMsg(False, "token consumed")
         if int(target.get("expires_at", 0)) < self._now():
             return public.returnMsg(False, "token expired")
+        target["accept_attempts"] = int(target.get("accept_attempts", 0) or 0) + 1
         resp = self.replica_import_profile(public.to_dict_obj({"profile_b64": target.get("profile_b64")}))
         target["consumed"] = True
         target["status"] = "consumed" if resp.get("status") else "failed"
-        self._audit(data, "replica_accept_handshake", {"token": token, "status": target["status"]})
+        target["accepted_at"] = self._now() if resp.get("status") else 0
+        if resp.get("status"):
+            target["last_error"] = ""
+            target["last_error_code"] = ""
+            target["last_error_at"] = 0
+        else:
+            msg = resp.get("msg", {}) if isinstance(resp, dict) else {}
+            if isinstance(msg, dict):
+                target["last_error"] = str(msg.get("message", "") or "握手接收失败")
+                target["last_error_code"] = str(msg.get("code", "") or "ERR_HANDSHAKE_ACCEPT")
+            else:
+                target["last_error"] = str(msg or "握手接收失败")
+                target["last_error_code"] = "ERR_HANDSHAKE_ACCEPT"
+            target["last_error_at"] = self._now()
+            self._append_log("handshake", "token={} 接收失败: {} ({})".format(token, target["last_error"], target["last_error_code"]))
+        self._audit(data, "replica_accept_handshake", {
+            "token": token,
+            "status": target["status"],
+            "accept_attempts": target.get("accept_attempts", 0),
+            "last_error": target.get("last_error", ""),
+            "last_error_code": target.get("last_error_code", ""),
+        })
         self._save_config(data)
         return resp
 
@@ -3274,6 +3301,8 @@ class mysql_multi_source_main:
             return self._fail("任务正在执行中", "ERR_TASK_RUNNING")
         if task.get("status") == "done":
             return self._fail("任务已完成，若需重跑请新建任务", "ERR_TASK_DONE")
+        if task.get("status") == "cancelled":
+            return self._fail("任务已取消，请新建任务后再执行", "ERR_TASK_CANCELLED")
 
         worker_id = "worker_" + uuid.uuid4().hex[:8]
         task["worker_id"] = worker_id
@@ -3501,8 +3530,9 @@ class mysql_multi_source_main:
         running = 0
         stopped = 0
         errors = 0
+        status_map = self._all_slave_status()
         for source in data.get("sources", []):
-            status = self._get_source_status(source.get("channel_name"))
+            status = self._map_status_row(status_map.get(source.get("channel_name") or "", {}) or {})
             if status.get("running"):
                 running += 1
             else:
