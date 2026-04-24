@@ -202,6 +202,7 @@ const masterTools = reactive({
 const masterToolInstalling = ref('') // '' | 'xtrabackup' | 'mariabackup'
 const masterToolLog = ref('')
 let masterToolLogTimer: any = null
+let masterToolLogSeq = 0
 
 async function refreshMasterTools() {
   masterTools.checking = true
@@ -220,6 +221,7 @@ async function refreshMasterTools() {
 }
 
 function stopMasterToolLogPolling() {
+  masterToolLogSeq += 1
   if (masterToolLogTimer) {
     clearInterval(masterToolLogTimer)
     masterToolLogTimer = null
@@ -227,7 +229,9 @@ function stopMasterToolLogPolling() {
 }
 
 async function pollMasterToolLog() {
+  const seq = ++masterToolLogSeq
   const res = await call('get_tool_install_log')
+  if (seq !== masterToolLogSeq) return
   if (isOk(res)) {
     const d = extractMsg(res) || {}
     masterToolLog.value = d.content || ''

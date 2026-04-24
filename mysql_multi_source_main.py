@@ -2594,6 +2594,58 @@ class mysql_multi_source_main:
             "code": code,
         }
 
+    def _handshake_overview_payload(self, sessions):
+        rows = []
+        status_counts = {"pending": 0, "consumed": 0, "failed": 0, "expired": 0}
+        failure_by_code = {}
+        total_attempts = 0
+        for session in sessions or []:
+            row = self._handshake_status_payload(session)
+            if not row:
+                continue
+            rows.append(row)
+            status = str(row.get("status", "pending") or "pending")
+            status_counts[status] = int(status_counts.get(status, 0) or 0) + 1
+            attempts = int(row.get("accept_attempts", 0) or 0)
+            total_attempts += attempts
+            if status in ("failed", "expired"):
+                code = str(row.get("last_error_code", "") or row.get("code", "") or "ERR_HANDSHAKE_ACCEPT")
+                failure_by_code[code] = int(failure_by_code.get(code, 0) or 0) + 1
+
+        failure_code_rows = []
+        for code, count in sorted(failure_by_code.items(), key=lambda item: (-item[1], item[0])):
+            failure_code_rows.append({"code": code, "count": count})
+
+        recent_failed = []
+        for row in sorted(rows, key=lambda item: int(item.get("last_error_at", 0) or item.get("created_at", 0) or 0), reverse=True):
+            if row.get("status") not in ("failed", "expired"):
+                continue
+            recent_failed.append({
+                "token": row.get("token", ""),
+                "profile_id": row.get("profile_id", ""),
+                "source_id": row.get("source_id", ""),
+                "channel_name": row.get("channel_name", ""),
+                "status": row.get("status", ""),
+                "last_error": row.get("last_error", ""),
+                "last_error_code": row.get("last_error_code", ""),
+                "last_error_at": row.get("last_error_at", 0),
+                "accept_attempts": row.get("accept_attempts", 0),
+            })
+            if len(recent_failed) >= 10:
+                break
+
+        recent_sessions = sorted(rows, key=lambda item: int(item.get("created_at", 0) or 0), reverse=True)[:10]
+        return {
+            "total_sessions": len(rows),
+            "total_attempts": total_attempts,
+            "status_counts": status_counts,
+            "failed_sessions": int(status_counts.get("failed", 0) or 0),
+            "expired_sessions": int(status_counts.get("expired", 0) or 0),
+            "failure_code_rows": failure_code_rows,
+            "recent_failed": recent_failed,
+            "recent_sessions": recent_sessions,
+        }
+
     def replica_accept_handshake(self, get):
         if not hasattr(get, "token"):
             return self._fail("缺少参数: token", "ERR_PARAM_REQUIRED")
@@ -2669,6 +2721,11 @@ class mysql_multi_source_main:
                     self._save_config(data)
                 return self._ok(self._handshake_status_payload(s), "握手状态获取成功", "HANDSHAKE_STATUS_OK")
         return self._fail("未找到该握手令牌", "ERR_HANDSHAKE_NOT_FOUND")
+
+    def handshake_overview(self, get=None):
+        data = self._load_config()
+        payload = self._handshake_overview_payload(data.get("handshake_sessions", []) or [])
+        return self._ok(payload, "握手统计获取成功", "HANDSHAKE_OVERVIEW_OK")
 
     def list_change_snapshots(self, get=None):
         data = self._load_config()
@@ -3197,6 +3254,20 @@ class mysql_multi_source_main:
             return self._fail("未找到该数据源", "ERR_NOT_FOUND")
         if not source.get("db_mappings"):
             return self._fail("请先配置库映射后再创建初始化任务", "ERR_MAPPINGS_EMPTY")
+        for task in data.get("bootstrap_tasks", []) or []:
+            if task.get("source_id") != source.get("source_id"):
+                continue
+            if task.get("status") not in ("pending", "running"):
+                continue
+            return self._fail(
+                "该来源已有执行中的初始化任务，请复用现有任务或等待其完成",
+                "ERR_TASK_ALREADY_ACTIVE",
+                {
+                    "task_id": task.get("task_id", ""),
+                    "status": task.get("status", ""),
+                    "current_step": task.get("current_step", ""),
+                },
+            )
 
         task_id = "boot_" + uuid.uuid4().hex[:12]
         task = {
