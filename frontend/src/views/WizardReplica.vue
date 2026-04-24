@@ -184,6 +184,7 @@ const syncTaskStatus = ref<any>(null)
 const syncTaskLog = ref('')
 const syncWatching = ref(false)
 let syncLogTimer: ReturnType<typeof setInterval> | null = null
+let syncRequestSeq = 0
 
 function stopInstallWatch() {
   if (installLogTimer) {
@@ -199,6 +200,7 @@ function stopSyncWatch() {
     syncLogTimer = null
   }
   syncWatching.value = false
+  syncRequestSeq += 1
 }
 
 async function refreshInstallLogSilent() {
@@ -207,10 +209,12 @@ async function refreshInstallLogSilent() {
 }
 
 async function refreshTaskRealtime(taskId: string) {
+  const seq = ++syncRequestSeq
   const [taskRes, logRes] = await Promise.all([
     call('get_bootstrap_task', { task_id: taskId }),
     call('get_task_logs', { task_id: taskId }),
   ])
+  if (seq !== syncRequestSeq) return
   if (isOk(taskRes)) syncTaskStatus.value = extractMsg(taskRes) || null
   if (isOk(logRes)) syncTaskLog.value = extractMsg(logRes) || ''
 
@@ -368,17 +372,23 @@ async function runConflictCheck(showSuccess = false) {
 async function retryTaskNow() {
   const taskId = startResult.value?.task_id
   if (!taskId) return
+  if (startingReplication.value || syncWatching.value) return
   syncTaskLog.value = ''
   syncTaskStatus.value = null
+  startingReplication.value = true
   const res = await call('trigger_bootstrap_task', { task_id: taskId })
-  if (isOk(res)) {
-    msg.success('已触发重试')
-    syncWatching.value = true
-    await refreshTaskRealtime(taskId)
-    stopSyncWatch()
-    syncLogTimer = setInterval(() => { refreshTaskRealtime(taskId) }, 1500)
-  } else {
-    msg.error(getMessage(res) || '重试触发失败')
+  try {
+    if (isOk(res)) {
+      msg.success('已触发重试')
+      stopSyncWatch()
+      syncWatching.value = true
+      await refreshTaskRealtime(taskId)
+      syncLogTimer = setInterval(() => { refreshTaskRealtime(taskId) }, 1500)
+    } else {
+      msg.error(getMessage(res) || '重试触发失败')
+    }
+  } finally {
+    startingReplication.value = false
   }
 }
 

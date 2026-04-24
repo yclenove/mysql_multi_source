@@ -2510,13 +2510,30 @@ class mysql_multi_source_main:
 
     def master_create_handshake(self, get):
         if not hasattr(get, "profile_b64"):
-            return public.returnMsg(False, "missing parameter: profile_b64")
+            return self._fail("缺少参数: profile_b64", "ERR_PARAM_REQUIRED")
         token = "hs_" + uuid.uuid4().hex
         ttl = int(get.ttl_seconds) if hasattr(get, "ttl_seconds") and str(get.ttl_seconds).strip().isdigit() else 600
         data = self._load_config()
+        profile_id = ""
+        source_id = ""
+        channel_name = ""
+        try:
+            raw = base64.b64decode(str(get.profile_b64)).decode("utf-8")
+            wrapped = json.loads(raw)
+            if isinstance(wrapped, dict):
+                payload = wrapped.get("payload", {})
+                profile_id = str(wrapped.get("profile_id", "") or "")
+                if isinstance(payload, dict):
+                    source_id = str(payload.get("source_id", "") or "")
+                    channel_name = str(payload.get("channel_name", "") or "")
+        except Exception:
+            pass
         session = {
             "token": token,
             "profile_b64": str(get.profile_b64),
+            "profile_id": profile_id,
+            "source_id": source_id,
+            "channel_name": channel_name,
             "status": "pending",
             "created_at": self._now(),
             "expires_at": self._now() + ttl,
@@ -2530,11 +2547,56 @@ class mysql_multi_source_main:
         data.setdefault("handshake_sessions", []).insert(0, session)
         self._audit(data, "master_create_handshake", {"token": token, "expires_at": session["expires_at"]})
         self._save_config(data)
-        return public.returnMsg(True, {"token": token, "expires_at": session["expires_at"]})
+        return self._ok({
+            "token": token,
+            "expires_at": session["expires_at"],
+            "profile_id": profile_id,
+            "source_id": source_id,
+            "channel_name": channel_name,
+        }, "握手令牌已创建", "HANDSHAKE_CREATED")
+
+    def _handshake_status_payload(self, session):
+        if not isinstance(session, dict):
+            return {}
+        now = self._now()
+        expires_at = int(session.get("expires_at", 0) or 0)
+        expired = expires_at > 0 and expires_at < now
+        raw_status = str(session.get("status", "pending") or "pending")
+        status = raw_status
+        if raw_status == "pending" and expired:
+            status = "expired"
+        message = "等待从库接收"
+        code = "HANDSHAKE_PENDING"
+        if status == "consumed":
+            message = "握手已被接收"
+            code = "HANDSHAKE_CONSUMED"
+        elif status == "failed":
+            message = str(session.get("last_error", "") or "握手接收失败")
+            code = str(session.get("last_error_code", "") or "ERR_HANDSHAKE_ACCEPT")
+        elif status == "expired":
+            message = str(session.get("last_error", "") or "握手已过期，请在主库重新创建")
+            code = str(session.get("last_error_code", "") or "ERR_HANDSHAKE_EXPIRED")
+        return {
+            "token": session.get("token", ""),
+            "profile_id": session.get("profile_id", ""),
+            "source_id": session.get("source_id", ""),
+            "channel_name": session.get("channel_name", ""),
+            "status": status,
+            "consumed": bool(session.get("consumed", False)),
+            "expired": expired,
+            "created_at": session.get("created_at", 0),
+            "expires_at": expires_at,
+            "accepted_at": int(session.get("accepted_at", 0) or 0),
+            "accept_attempts": int(session.get("accept_attempts", 0) or 0),
+            "last_error": str(session.get("last_error", "") or ""),
+            "last_error_code": str(session.get("last_error_code", "") or ""),
+            "message": message,
+            "code": code,
+        }
 
     def replica_accept_handshake(self, get):
         if not hasattr(get, "token"):
-            return public.returnMsg(False, "missing parameter: token")
+            return self._fail("缺少参数: token", "ERR_PARAM_REQUIRED")
         token = str(get.token).strip()
         data = self._load_config()
         target = None
@@ -2543,12 +2605,24 @@ class mysql_multi_source_main:
                 target = s
                 break
         if not target:
-            return public.returnMsg(False, "token not found")
+            return self._fail("未找到该握手令牌", "ERR_HANDSHAKE_NOT_FOUND")
         if target.get("consumed"):
-            return public.returnMsg(False, "token consumed")
-        if int(target.get("expires_at", 0)) < self._now():
-            return public.returnMsg(False, "token expired")
+            return self._fail("握手已被消费，请重新创建", "ERR_HANDSHAKE_CONSUMED")
         target["accept_attempts"] = int(target.get("accept_attempts", 0) or 0) + 1
+        if int(target.get("expires_at", 0)) < self._now():
+            target["status"] = "expired"
+            target["last_error"] = "握手已过期，请在主库重新创建"
+            target["last_error_code"] = "ERR_HANDSHAKE_EXPIRED"
+            target["last_error_at"] = self._now()
+            self._audit(data, "replica_accept_handshake", {
+                "token": token,
+                "status": "expired",
+                "accept_attempts": target.get("accept_attempts", 0),
+                "last_error": target.get("last_error", ""),
+                "last_error_code": target.get("last_error_code", ""),
+            })
+            self._save_config(data)
+            return self._fail(target["last_error"], target["last_error_code"])
         resp = self.replica_import_profile(public.to_dict_obj({"profile_b64": target.get("profile_b64")}))
         target["consumed"] = True
         target["status"] = "consumed" if resp.get("status") else "failed"
@@ -2579,13 +2653,22 @@ class mysql_multi_source_main:
 
     def handshake_status(self, get):
         if not hasattr(get, "token"):
-            return public.returnMsg(False, "missing parameter: token")
+            return self._fail("缺少参数: token", "ERR_PARAM_REQUIRED")
         token = str(get.token).strip()
         data = self._load_config()
         for s in data.get("handshake_sessions", []):
             if s.get("token") == token:
-                return public.returnMsg(True, s)
-        return public.returnMsg(False, "token not found")
+                if s.get("status") == "pending" and int(s.get("expires_at", 0) or 0) < self._now():
+                    s["status"] = "expired"
+                    if not s.get("last_error"):
+                        s["last_error"] = "握手已过期，请在主库重新创建"
+                    if not s.get("last_error_code"):
+                        s["last_error_code"] = "ERR_HANDSHAKE_EXPIRED"
+                    if not int(s.get("last_error_at", 0) or 0):
+                        s["last_error_at"] = self._now()
+                    self._save_config(data)
+                return self._ok(self._handshake_status_payload(s), "握手状态获取成功", "HANDSHAKE_STATUS_OK")
+        return self._fail("未找到该握手令牌", "ERR_HANDSHAKE_NOT_FOUND")
 
     def list_change_snapshots(self, get=None):
         data = self._load_config()

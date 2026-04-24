@@ -14,12 +14,14 @@ const dash = useDashboardStore()
 const env = useEnvStore()
 const msg = useMessage()
 const installLoading = ref<Record<string, boolean>>({})
+const sourceActionLoading = ref<Record<string, boolean>>({})
 const logVisible = ref(false)
 const logTaskId = ref('')
 const logTaskStep = ref('')
 const logTaskStatus = ref('')
 const logText = ref('')
 let logTimer: ReturnType<typeof setInterval> | null = null
+let logRequestSeq = 0
 
 onMounted(() => dash.startPolling(5000))
 onBeforeUnmount(() => {
@@ -87,36 +89,54 @@ function delayText(s: SourceStatus['status']): string {
 }
 
 async function startSource(sid: string) {
+  if (sourceActionLoading.value[sid]) return
+  sourceActionLoading.value[sid] = true
   const liveTask = taskFor(sid)
-  if (liveTask && liveTask.status === 'pending') {
-    const trig = await call('trigger_bootstrap_task', { task_id: liveTask.task_id })
-    if (isOk(trig)) {
-      msg.success('初始化任务已触发，点击"查看日志"跟踪进度')
-      dash.refresh()
+  try {
+    if (liveTask && liveTask.status === 'pending') {
+      const trig = await call('trigger_bootstrap_task', { task_id: liveTask.task_id })
+      if (isOk(trig)) {
+        msg.success('初始化任务已触发，点击"查看日志"跟踪进度')
+        dash.refresh()
+        return
+      }
+      msg.error(getMessage(trig) || '触发初始化任务失败')
       return
     }
-    msg.error(getMessage(trig) || '触发初始化任务失败')
-    return
-  }
 
-  const res = await call('start_channel', { source_id: sid })
-  if (isOk(res)) {
-    msg.success('通道已启动')
-    dash.refresh()
+    const res = await call('start_channel', { source_id: sid })
+    if (isOk(res)) {
+      msg.success('通道已启动')
+      dash.refresh()
+    }
+    else msg.error(getMessage(res) || '启动失败')
+  } finally {
+    sourceActionLoading.value[sid] = false
   }
-  else msg.error(getMessage(res) || '启动失败')
 }
 async function stopSource(sid: string) {
+  if (sourceActionLoading.value[sid]) return
   if (!await btConfirm('暂停复制', `确认暂停 ${sid}？`)) return
-  const res = await call('stop_channel', { source_id: sid })
-  if (isOk(res)) { msg.success('通道已暂停'); dash.refresh() }
-  else msg.error(getMessage(res) || '暂停失败')
+  sourceActionLoading.value[sid] = true
+  try {
+    const res = await call('stop_channel', { source_id: sid })
+    if (isOk(res)) { msg.success('通道已暂停'); dash.refresh() }
+    else msg.error(getMessage(res) || '暂停失败')
+  } finally {
+    sourceActionLoading.value[sid] = false
+  }
 }
 async function removeSource(sid: string) {
+  if (sourceActionLoading.value[sid]) return
   if (!await btConfirm('移除来源', `确认移除 ${sid}？通道将停止并删除配置。`)) return
-  const res = await call('remove_source', { source_id: sid })
-  if (isOk(res)) { msg.success('已移除'); dash.refresh() }
-  else msg.error(getMessage(res) || '移除失败')
+  sourceActionLoading.value[sid] = true
+  try {
+    const res = await call('remove_source', { source_id: sid })
+    if (isOk(res)) { msg.success('已移除'); dash.refresh() }
+    else msg.error(getMessage(res) || '移除失败')
+  } finally {
+    sourceActionLoading.value[sid] = false
+  }
 }
 function stopLogPolling() {
   if (logTimer) {
@@ -126,10 +146,12 @@ function stopLogPolling() {
 }
 
 async function refreshTaskLog(taskId: string) {
+  const seq = ++logRequestSeq
   const [taskRes, logRes] = await Promise.all([
     call('get_bootstrap_task', { task_id: taskId }),
     call('get_task_logs', { task_id: taskId }),
   ])
+  if (seq !== logRequestSeq || logTaskId.value !== taskId || !logVisible.value) return
   if (isOk(taskRes)) {
     const t = taskRes.msg || {}
     logTaskStatus.value = t.status || ''
@@ -145,6 +167,7 @@ async function refreshTaskLog(taskId: string) {
 
 function openTaskLog(taskId: string) {
   if (!taskId) return
+  logRequestSeq += 1
   logVisible.value = true
   logTaskId.value = taskId
   logTaskStatus.value = ''
@@ -245,13 +268,13 @@ async function registerPanelDbs() {
               <NButton v-if="bootstrapOf(src.source_id)" size="tiny" type="info" secondary disabled>
                 <template #icon><NIcon :component="PlayOutline" /></template>初始化中…
               </NButton>
-              <NButton v-else-if="!src.status.running" size="tiny" type="success" secondary @click.stop="startSource(src.source_id)">
+              <NButton v-else-if="!src.status.running" size="tiny" type="success" secondary :loading="sourceActionLoading[src.source_id]" :disabled="sourceActionLoading[src.source_id]" @click.stop="startSource(src.source_id)">
                 <template #icon><NIcon :component="PlayOutline" /></template>{{ isPendingTask(src.source_id) ? '继续初始化' : '启动通道' }}
               </NButton>
-              <NButton v-else size="tiny" type="warning" secondary @click.stop="stopSource(src.source_id)">
+              <NButton v-else size="tiny" type="warning" secondary :loading="sourceActionLoading[src.source_id]" :disabled="sourceActionLoading[src.source_id]" @click.stop="stopSource(src.source_id)">
                 <template #icon><NIcon :component="PauseOutline" /></template>暂停
               </NButton>
-              <NButton size="tiny" type="error" secondary @click.stop="removeSource(src.source_id)">
+              <NButton size="tiny" type="error" secondary :loading="sourceActionLoading[src.source_id]" :disabled="sourceActionLoading[src.source_id]" @click.stop="removeSource(src.source_id)">
                 <template #icon><NIcon :component="TrashOutline" /></template>
               </NButton>
             </NSpace>
