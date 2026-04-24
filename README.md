@@ -327,3 +327,26 @@
 - 握手链路从“单 token 状态”进一步提升到“可聚合、可总览”的视图
 - 后端补上同来源任务创建的硬护栏，避免并发初始化
 - 主库工具安装日志在慢请求场景下更稳定，不再出现旧轮询覆盖新日志
+
+## 阶段三十一：后端第一批模块化拆分（已完成）
+
+### 拆分范围
+
+- 新增 `mms/` 包，先抽离最稳定的一批基础能力：
+  - `mms/validators.py`
+  - `mms/crypto.py`
+  - `mms/config_store.py`
+  - `mms/logging_audit.py`
+  - `mms/handshake_service.py`
+- `mysql_multi_source_main.py` 保持入口文件和类名不变，仅改为通过 mixin 复用上述实现
+
+### 本轮原则
+
+- 纯搬运，不改接口路由
+- 纯搬运，不改数据结构
+- 纯搬运，不改业务行为
+
+### 价值
+
+- 先把校验、加密、配置存储、日志审计、profile/handshake 等稳定能力从超大单文件中剥离
+- 为后续继续拆 `source/channel/bootstrap/wizard/dashboard` 等业务模块打基础
