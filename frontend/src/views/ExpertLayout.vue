@@ -44,7 +44,99 @@ async function ensureConfirmed(method: string, data: Record<string, any>) {
   return btConfirm(config.title, config.content(data))
 }
 
+function validateBeforeRun(method: string, data: Record<string, any>) {
+  const requireFields = (fields: Array<[string, string]>) => {
+    for (const [key, label] of fields) {
+      if (!String(data[key] ?? '').trim()) {
+        msg.warning(`请先填写${label}`)
+        return false
+      }
+    }
+    return true
+  }
+
+  if (method === 'add_source') {
+    if (!requireFields([
+      ['source_id', '来源 ID'],
+      ['channel_name', '通道名'],
+      ['master_host', '主库地址'],
+      ['repl_user', '复制账号'],
+      ['repl_password', '复制密码'],
+    ])) return false
+    const port = Number(data.master_port)
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      msg.warning('主库端口必须在 1-65535 之间')
+      return false
+    }
+  }
+
+  if (method === 'test_master_connection_direct') {
+    if (!requireFields([
+      ['master_host', '主库地址'],
+      ['repl_user', '复制账号'],
+      ['repl_password', '复制密码'],
+    ])) return false
+    const port = Number(data.master_port)
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      msg.warning('端口必须在 1-65535 之间')
+      return false
+    }
+  }
+
+  if (method === 'set_db_mappings') {
+    if (!requireFields([
+      ['source_id', '来源 ID'],
+      ['mappings', '映射 JSON'],
+    ])) return false
+    try {
+      const parsed = JSON.parse(String(data.mappings))
+      if (!Array.isArray(parsed)) {
+        msg.warning('映射 JSON 必须是数组格式')
+        return false
+      }
+    } catch {
+      msg.warning('映射 JSON 格式不正确')
+      return false
+    }
+  }
+
+  if (['list_db_mappings', 'create_bootstrap_task'].includes(method)) {
+    if (!requireFields([['source_id', '来源 ID']])) return false
+  }
+
+  if (['trigger_bootstrap_task', 'get_bootstrap_task', 'get_task_logs', 'cancel_bootstrap_task'].includes(method)) {
+    if (!requireFields([['task_id', '任务 ID']])) return false
+  }
+
+  if (['rollback_snapshot'].includes(method)) {
+    if (!requireFields([['snapshot_id', '快照 ID']])) return false
+  }
+
+  if (['replica_verify_profile', 'replica_import_profile', 'master_create_handshake'].includes(method)) {
+    if (!requireFields([['profile_b64', '配置单内容']])) return false
+  }
+
+  if (['replica_accept_handshake', 'handshake_status'].includes(method)) {
+    if (!requireFields([['token', '握手 Token']])) return false
+  }
+
+  if (['master_create_repl_user', 'master_auto_fix_apply'].includes(method)) {
+    if (!requireFields([
+      ['repl_user', '复制账号'],
+      ['repl_password', '复制密码'],
+      ['replica_host', '允许连接主机'],
+    ])) return false
+    if (!/^[A-Za-z0-9_]{1,32}$/.test(String(data.repl_user).trim())) {
+      msg.warning('复制账号仅允许字母、数字、下划线，最长 32 位')
+      return false
+    }
+  }
+
+  return true
+}
+
 async function run(method: string, data: Record<string, any> = {}, label = '') {
+  if (!validateBeforeRun(method, data)) return
   if (!await ensureConfirmed(method, data)) return
   loading.value = true
   output.value = ''
