@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, reactive } from 'vue'
+import { ref, reactive, computed } from 'vue'
 import {
   NTabs, NTabPane, NCard, NButton, NSpace, NInput, NInputNumber,
   NSelect, NAlert, NCollapse, NCollapseItem, NTag, useMessage,
@@ -10,6 +10,44 @@ import { call, isOk, getMessage, extractMsg, btConfirm } from '@/api/plugin'
 const msg = useMessage()
 const output = ref('')
 const loading = ref(false)
+const lastResponse = ref<any>(null)
+const lastMethod = ref('')
+const lastLabel = ref('')
+
+const responseStatus = computed<'success' | 'error' | 'info'>(() => {
+  if (!lastResponse.value) return 'info'
+  return lastResponse.value?.status === true ? 'success' : 'error'
+})
+
+const responseMessage = computed(() => {
+  if (!lastResponse.value) return ''
+  return getMessage(lastResponse.value) || (lastResponse.value?.status === true ? '执行成功' : '执行失败')
+})
+
+const responseData = computed(() => {
+  if (!lastResponse.value) return null
+  const raw = extractMsg(lastResponse.value)
+  if (raw && typeof raw === 'object') return raw
+  return null
+})
+
+const responseEntries = computed(() => {
+  const data = responseData.value
+  if (!data || Array.isArray(data)) return []
+  return Object.entries(data).slice(0, 12)
+})
+
+const responseListPreview = computed(() => {
+  const data = responseData.value
+  if (!Array.isArray(data)) return []
+  return data.slice(0, 10)
+})
+
+function formatValue(value: any) {
+  if (value === null || value === undefined || value === '') return '-'
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value)
+  return JSON.stringify(value, null, 2)
+}
 
 const confirmMap: Record<string, { title: string; content: (data: Record<string, any>) => string }> = {
   cancel_bootstrap_task: {
@@ -140,12 +178,17 @@ async function run(method: string, data: Record<string, any> = {}, label = '') {
   if (!await ensureConfirmed(method, data)) return
   loading.value = true
   output.value = ''
+  lastResponse.value = null
+  lastMethod.value = method
+  lastLabel.value = label || method
   try {
     const res = await call(method, data)
+    lastResponse.value = res
     output.value = JSON.stringify(res, null, 2)
     if (isOk(res)) msg.success(label || method + ' 成功')
     else msg.error(getMessage(res) || method + ' 失败')
   } catch (e: any) {
+    lastResponse.value = { status: false, msg: String(e) }
     output.value = String(e)
     msg.error(String(e))
   } finally {
@@ -319,7 +362,35 @@ const toolOptions = [
 
     <!-- Output panel -->
     <NCard v-if="output" title="执行结果" size="small" style="margin-top:16px">
-      <pre style="max-height:400px; overflow:auto; font-size:12px; background:#f9f9f9; padding:8px; border-radius:4px; white-space:pre-wrap; word-break:break-all">{{ output }}</pre>
+      <NAlert :type="responseStatus" :bordered="false" style="margin-bottom:12px">
+        <strong>{{ lastLabel || lastMethod }}</strong>
+        <span style="margin-left:8px">{{ responseMessage }}</span>
+      </NAlert>
+
+      <NDescriptions :column="2" size="small" bordered style="margin-bottom:12px">
+        <NDescriptionsItem label="调用方法">{{ lastMethod || '-' }}</NDescriptionsItem>
+        <NDescriptionsItem label="执行状态">
+          <NTag size="small" :bordered="false" :type="responseStatus === 'success' ? 'success' : (responseStatus === 'error' ? 'error' : 'info')">
+            {{ responseStatus === 'success' ? '成功' : responseStatus === 'error' ? '失败' : '待执行' }}
+          </NTag>
+        </NDescriptionsItem>
+      </NDescriptions>
+
+      <NCard v-if="responseEntries.length" title="结构化摘要" size="small" embedded style="margin-bottom:12px">
+        <NDescriptions :column="1" size="small" bordered>
+          <NDescriptionsItem v-for="([key, value]) in responseEntries" :key="key" :label="key">
+            <pre class="mms-expert__value">{{ formatValue(value) }}</pre>
+          </NDescriptionsItem>
+        </NDescriptions>
+      </NCard>
+
+      <NCard v-else-if="responseListPreview.length" title="列表预览" size="small" embedded style="margin-bottom:12px">
+        <pre class="mms-expert__output">{{ JSON.stringify(responseListPreview, null, 2) }}</pre>
+      </NCard>
+
+      <NCard title="原始响应" size="small" embedded>
+        <pre class="mms-expert__output">{{ output }}</pre>
+      </NCard>
     </NCard>
   </div>
 </template>
@@ -328,5 +399,25 @@ const toolOptions = [
 .mms-expert {
   max-width: 960px;
   margin: 0 auto;
+}
+
+.mms-expert__output {
+  max-height: 400px;
+  overflow: auto;
+  font-size: 12px;
+  background: #f9f9f9;
+  padding: 8px;
+  border-radius: 4px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin: 0;
+}
+
+.mms-expert__value {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-size: 12px;
+  line-height: 1.5;
 }
 </style>
