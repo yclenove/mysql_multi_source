@@ -11,7 +11,41 @@ const msg = useMessage()
 const output = ref('')
 const loading = ref(false)
 
+const confirmMap: Record<string, { title: string; content: (data: Record<string, any>) => string }> = {
+  cancel_bootstrap_task: {
+    title: '取消初始化任务',
+    content: (data) => `确认取消任务 ${data.task_id || '-'}？已开始的初始化流程会被标记为取消。`,
+  },
+  install_bootstrap_tool: {
+    title: '安装初始化工具',
+    content: (data) => `确认安装 ${data.tool_name || '所选工具'}？该操作会修改当前系统软件环境。`,
+  },
+  run_stress_wizard: {
+    title: '开始压测',
+    content: (data) => `确认开始压测？将创建 ${data.source_count || 0} 个来源、每个来源 ${data.task_per_source || 0} 个任务，可能占用较多系统资源。`,
+  },
+  master_auto_fix_apply: {
+    title: '执行主库修复',
+    content: (data) => `确认执行主库一键修复？这会修改主库复制相关配置${data.auto_restart === '1' ? '，并在需要时自动重启 MySQL' : ''}。`,
+  },
+  master_restart_mysql: {
+    title: '重启 MySQL',
+    content: () => '确认重启当前 MySQL 服务？短时间内会中断数据库连接。',
+  },
+  rollback_snapshot: {
+    title: '回滚快照',
+    content: (data) => `确认回滚快照 ${data.snapshot_id || '-'}？这会恢复历史配置，可能覆盖当前主库设置。`,
+  },
+}
+
+async function ensureConfirmed(method: string, data: Record<string, any>) {
+  const config = confirmMap[method]
+  if (!config) return true
+  return btConfirm(config.title, config.content(data))
+}
+
 async function run(method: string, data: Record<string, any> = {}, label = '') {
+  if (!await ensureConfirmed(method, data)) return
   loading.value = true
   output.value = ''
   try {
