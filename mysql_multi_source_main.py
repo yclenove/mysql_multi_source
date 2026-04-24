@@ -462,6 +462,77 @@ class mysql_multi_source_main:
                 return item
         return None
 
+    def _collect_target_db_conflicts(self, mappings, exclude_source_id=""):
+        """Check whether target_db names would collide with other sources or themselves."""
+        data = self._load_config()
+        exclude_source_id = str(exclude_source_id or "").strip()
+        normalized = []
+        seen_in_request = {}
+        conflicts = []
+
+        for idx, m in enumerate(mappings or []):
+            if not isinstance(m, dict):
+                continue
+            source_db = str(m.get("source_db", "")).strip()
+            target_db = str(m.get("target_db", "")).strip()
+            if not source_db or not target_db:
+                continue
+            normalized.append({"source_db": source_db, "target_db": target_db})
+            duplicate_indexes = seen_in_request.setdefault(target_db, [])
+            duplicate_indexes.append(idx)
+
+        for target_db, indexes in seen_in_request.items():
+            if len(indexes) > 1:
+                conflicts.append({
+                    "target_db": target_db,
+                    "type": "request_duplicate",
+                    "source_ids": [],
+                    "mappings": [normalized[i] for i in indexes if i < len(normalized)],
+                    "message": "本次选择中有多个来源库映射到了同一个目标库",
+                })
+
+        existing_by_target = {}
+        for src in data.get("sources", []) or []:
+            src_id = str(src.get("source_id", "")).strip()
+            if exclude_source_id and src_id == exclude_source_id:
+                continue
+            for mapping in src.get("db_mappings", []) or []:
+                target_db = str(mapping.get("target_db", "")).strip()
+                if not target_db:
+                    continue
+                existing_by_target.setdefault(target_db, []).append({
+                    "source_id": src_id,
+                    "source_db": str(mapping.get("source_db", "")).strip(),
+                    "target_db": target_db,
+                })
+
+        for item in normalized:
+            target_db = item.get("target_db")
+            matched = existing_by_target.get(target_db) or []
+            if not matched:
+                continue
+            conflicts.append({
+                "target_db": target_db,
+                "type": "existing_target_db",
+                "source_ids": [x.get("source_id") for x in matched if x.get("source_id")],
+                "mappings": matched,
+                "message": "目标库名已被其他来源占用",
+            })
+
+        deduped = []
+        seen_keys = set()
+        for item in conflicts:
+            key = "{}|{}|{}".format(
+                item.get("type", ""),
+                item.get("target_db", ""),
+                ",".join(sorted(item.get("source_ids") or [])),
+            )
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped.append(item)
+        return deduped
+
     def _find_bootstrap_task(self, data, task_id):
         for task in data.get("bootstrap_tasks", []):
             if task.get("task_id") == task_id:
@@ -636,10 +707,31 @@ class mysql_multi_source_main:
         return out, err
 
     def _get_local_mysql_root_password(self):
+        # Different BaoTa versions may store mysql root password in different
+        # places; some setups intentionally keep it empty (socket auth / empty
+        # root password). We therefore return '' as a valid outcome rather
+        # than treating it as fatal.
         try:
-            return public.M("config").where("id=?", (1,)).getField("mysql_root")
+            v = public.M("config").where("id=?", (1,)).getField("mysql_root")
+            if v is not None:
+                v = str(v).strip()
+                if v:
+                    return v
         except Exception:
-            return ""
+            pass
+        # Fallback: config file (best-effort)
+        try:
+            cfg_path = "/www/server/panel/config/config.json"
+            if os.path.exists(cfg_path):
+                raw = public.ReadFile(cfg_path) or ""
+                if raw:
+                    cfg = json.loads(raw)
+                    v = str(cfg.get("mysql_root", "")).strip()
+                    if v:
+                        return v
+        except Exception:
+            pass
+        return ""
 
     def _register_db_in_panel(self, db_name, source_id=""):
         """Ensure BaoTa's panel SQLite knows about ``db_name``.
@@ -740,6 +832,28 @@ class mysql_multi_source_main:
             return "physical"
         return "logical"
 
+    def _parse_version_major_minor(self, ver_text):
+        s = str(ver_text or "")
+        m = re.search(r"(\d+)\.(\d+)", s)
+        if not m:
+            return None
+        try:
+            return int(m.group(1)), int(m.group(2))
+        except Exception:
+            return None
+
+    def _is_xtrabackup_mysql_compatible(self, xb_ver_text, mysql_ver_text):
+        xb = str(xb_ver_text or "").lower()
+        my = str(mysql_ver_text or "").lower()
+        my_mm = self._parse_version_major_minor(my)
+        if not my_mm:
+            return True, ""
+        if "xtrabackup version 8." in xb and my_mm[0] == 5:
+            return False, "主库是 MySQL {}，但 xtrabackup 为 8.0".format(mysql_ver_text)
+        if ("xtrabackup version 2.4" in xb or "xtrabackup 2.4" in xb) and my_mm[0] >= 8:
+            return False, "主库是 MySQL {}，但 xtrabackup 为 2.4".format(mysql_ver_text)
+        return True, ""
+
     def _run_physical_bootstrap(self, source, task):
         """Real physical bootstrap pipeline using xtrabackup/mariabackup + SSH.
 
@@ -805,6 +919,64 @@ class mysql_multi_source_main:
             task["effective_mode_note"] = "fallback_logical_ssh_unavailable"
             return self._run_logical_bootstrap(source, task)
 
+        # xtrabackup major version must match MySQL major family:
+        #   - MySQL 5.7  <-> xtrabackup 2.4
+        #   - MySQL 8.0  <-> xtrabackup 8.0
+        if tool == "xtrabackup":
+            remote_mysql_ver = ""
+            remote_tool_ver = ""
+            local_tool_ver = ""
+            try:
+                rv = self._run_shell(
+                    [
+                        "ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                        "{}@{}".format(ssh_user, source_host),
+                        "mysql -Nse \"SELECT @@version\" 2>/dev/null || true",
+                    ],
+                    timeout=12,
+                )
+                remote_mysql_ver = str(rv.get("stdout") or "").strip()
+            except Exception:
+                remote_mysql_ver = ""
+            try:
+                rv = self._run_shell(
+                    [
+                        "ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                        "{}@{}".format(ssh_user, source_host),
+                        "{} --version 2>/dev/null".format(tool),
+                    ],
+                    timeout=12,
+                )
+                _s = str(rv.get("stdout") or "").strip()
+                remote_tool_ver = _s.splitlines()[0].strip() if _s else ""
+            except Exception:
+                remote_tool_ver = ""
+            try:
+                lv = self._run_shell([tool, "--version"], timeout=8)
+                _s = str(lv.get("stdout") or "").strip()
+                local_tool_ver = _s.splitlines()[0].strip() if _s else ""
+            except Exception:
+                local_tool_ver = ""
+
+            if remote_mysql_ver:
+                ok_r, why_r = self._is_xtrabackup_mysql_compatible(remote_tool_ver, remote_mysql_ver)
+                ok_l, why_l = self._is_xtrabackup_mysql_compatible(local_tool_ver, remote_mysql_ver)
+                if not ok_r or not ok_l:
+                    self._append_task_log(
+                        task_id,
+                        "[physical→logical] xtrabackup 与主库版本不匹配，自动改用 logical\n"
+                        "主库 MySQL: {}\n主库 xtrabackup: {}\n从库 xtrabackup: {}\n{}\n{}\n"
+                        "建议：MySQL 5.7 请安装 percona-xtrabackup-24；MySQL 8.0 请安装 percona-xtrabackup-80".format(
+                            remote_mysql_ver or "unknown",
+                            remote_tool_ver or "unknown",
+                            local_tool_ver or "unknown",
+                            ("主库检查: " + why_r) if why_r else "",
+                            ("从库检查: " + why_l) if why_l else "",
+                        ),
+                    )
+                    task["effective_mode_note"] = "fallback_logical_xtrabackup_version_incompatible"
+                    return self._run_logical_bootstrap(source, task)
+
         task_dir = os.path.join(self.bootstrap_root, task_id)
         backup_dir = os.path.join(task_dir, "xb_backup")
         if not os.path.exists(backup_dir):
@@ -825,18 +997,27 @@ class mysql_multi_source_main:
             except Exception:
                 pass
 
-        # Stream backup over SSH. Password is passed via MYSQL_PWD on remote via env, not argv.
-        # Because ssh spawns a remote shell we use `env MYSQL_PWD=... tool ...` on the remote side,
-        # where the password is still visible in ps; it is unavoidable without a .mylogin.cnf.
+        # Stream backup over SSH.
+        # NOTE:
+        #   Some environments drop MYSQL_PWD from the remote command context
+        #   (observed as "using password: NO" in /tmp/mms_xb.err). To make the
+        #   physical path deterministic we pass both:
+        #     1) MYSQL_PWD=... env
+        #     2) explicit --password=... argument
+        #   This leaks the secret in process list on the master host during
+        #   execution, but is acceptable for this controlled bootstrap stage.
+        remote_err_path = "/tmp/mms_xb_{}.err".format(task_id)
         remote_cmd = (
             "MYSQL_PWD={pwd_q} {tool} --backup --stream=xbstream "
-            "--user={user_q} --host=127.0.0.1 --port={port} --databases={dbs_q} 2>/tmp/mms_xb.err"
+            "--user={user_q} --password={pwd_q} --host=127.0.0.1 --port={port} "
+            "--databases={dbs_q} 2>{err_q}"
         ).format(
             pwd_q=self._shell_quote(pwd),
             tool=tool,
             user_q=self._shell_quote(user),
             port=source_port,
             dbs_q=self._shell_quote(dbs_list),
+            err_q=self._shell_quote(remote_err_path),
         )
         pipeline = "ssh -o BatchMode=yes -o StrictHostKeyChecking=no {tgt} {remote} | xbstream -x -C {dir}".format(
             tgt=self._shell_quote("{}@{}".format(ssh_user, source_host)),
@@ -844,12 +1025,20 @@ class mysql_multi_source_main:
             dir=self._shell_quote(backup_dir),
         )
         self._append_task_log(task_id, "[physical] 开始流式备份到: {}".format(backup_dir))
-        r = self._run_shell(pipeline, shell=True, timeout=7200)
+        # IMPORTANT: use bash + pipefail, otherwise shell pipelines may return
+        # the exit code of xbstream only, hiding ssh/xtrabackup failures.
+        r = self._run_shell(
+            ["bash", "-lc", "set -o pipefail; " + pipeline],
+            timeout=7200,
+        )
         _dump_stderr(backup_log, r.get("stderr") or "")
         if r["code"] != 0:
             err = (r.get("stderr") or "")[:800]
             self._append_task_log(task_id, "[physical] backup 失败，降级 logical：{}".format(err))
-            self._append_task_log(task_id, "[physical] 完整日志: {} （主库侧: /tmp/mms_xb.err）".format(backup_log))
+            self._append_task_log(
+                task_id,
+                "[physical] 完整日志: {} （主库侧: {}）".format(backup_log, remote_err_path),
+            )
             task["effective_mode_note"] = "fallback_logical_backup_fail"
             return self._run_logical_bootstrap(source, task)
         self._append_task_log(task_id, "[physical] 流式备份完成")
@@ -865,12 +1054,37 @@ class mysql_multi_source_main:
                         xb_total_mb += os.path.getsize(os.path.join(root_d, fn)) / 1024.0 / 1024.0
                     except Exception:
                         pass
+            has_checkpoints = os.path.exists(os.path.join(backup_dir, "xtrabackup_checkpoints"))
             self._append_task_log(
                 task_id,
-                "[physical] 备份目录内容: {} 项, 约 {:.2f} MB (顶层: {})".format(
-                    len(xb_entries), xb_total_mb, ", ".join(xb_entries[:6]) + ("..." if len(xb_entries) > 6 else "")
+                "[physical] 备份目录内容: {} 项, 约 {:.2f} MB, checkpoints={} (顶层: {})".format(
+                    len(xb_entries), xb_total_mb, "yes" if has_checkpoints else "no",
+                    ", ".join(xb_entries[:6]) + ("..." if len(xb_entries) > 6 else "")
                 ),
             )
+            if not has_checkpoints:
+                # Physical stream produced no valid xtrabackup metadata.
+                # Try to fetch remote error file for direct diagnosis.
+                try:
+                    remote_err = self._run_shell(
+                        [
+                            "ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                            "{}@{}".format(ssh_user, source_host),
+                            "tail -n 80 {} 2>/dev/null || echo '(主库无 {})'".format(
+                                self._shell_quote(remote_err_path),
+                                self._shell_quote(remote_err_path),
+                            ),
+                        ],
+                        timeout=12,
+                    )
+                    remote_tail = (remote_err.get("stdout") or "").strip()
+                except Exception:
+                    remote_tail = ""
+                if remote_tail:
+                    self._append_task_log(task_id, "[physical] 主库 /tmp/mms_xb.err 尾部:\n{}".format(remote_tail))
+                self._append_task_log(task_id, "[physical] 未生成 xtrabackup_checkpoints，判定物理备份无效，自动改用 logical")
+                task["effective_mode_note"] = "fallback_logical_empty_physical_backup"
+                return self._run_logical_bootstrap(source, task)
         except Exception as ex:
             self._append_task_log(task_id, "[physical] 无法枚举备份目录: {}".format(ex))
 
@@ -942,9 +1156,13 @@ class mysql_multi_source_main:
         source_pwd = self._decrypted_password(source)
         self._append_task_log(task_id, "读取本地 MySQL root 密码...")
         local_root_pwd = self._get_local_mysql_root_password() or ""
-        if not local_root_pwd:
-            raise Exception("未获取到本地MySQL root密码，无法执行导入")
-        self._append_task_log(task_id, "本地 root 密码读取完成，共 {} 个库待处理".format(len(mappings)))
+        if local_root_pwd:
+            self._append_task_log(task_id, "本地 root 密码读取完成，共 {} 个库待处理".format(len(mappings)))
+        else:
+            self._append_task_log(
+                task_id,
+                "未读取到本地 root 密码，将尝试空密码/本机默认认证继续导入（若失败请在宝塔数据库设置 root 密码）"
+            )
 
         task_dir = os.path.join(self.bootstrap_root, task_id)
         if not os.path.exists(task_dir):
@@ -1123,7 +1341,7 @@ class mysql_multi_source_main:
                     stdin=fin,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    env=dict(os.environ, MYSQL_PWD=str(local_root_pwd)),
+                    env=(dict(os.environ, MYSQL_PWD=str(local_root_pwd)) if local_root_pwd else dict(os.environ)),
                 )
                 while True:
                     try:
@@ -2580,6 +2798,44 @@ class mysql_multi_source_main:
             return public.returnMsg(False, "source not found")
         return public.returnMsg(True, item.get("db_mappings", []))
 
+    def check_target_db_conflicts(self, get=None):
+        if get is None or not hasattr(get, "mappings"):
+            return self._fail("缺少参数: mappings", "ERR_PARAM_REQUIRED")
+
+        raw_mappings = getattr(get, "mappings", [])
+        if isinstance(raw_mappings, str):
+            try:
+                raw_mappings = json.loads(raw_mappings) if raw_mappings.strip() else []
+            except Exception:
+                return self._fail("mappings 格式非法（需 JSON）", "ERR_PARAM_INVALID")
+        if not isinstance(raw_mappings, list):
+            return self._fail("mappings 必须为列表格式", "ERR_PARAM_INVALID")
+
+        exclude_source_id = str(getattr(get, "exclude_source_id", "") or "").strip()
+        normalized = []
+        for m in raw_mappings:
+            if not isinstance(m, dict):
+                return self._fail("映射项格式不正确", "ERR_PARAM_INVALID")
+            source_db = str(m.get("source_db", "")).strip()
+            target_db = str(m.get("target_db", "")).strip()
+            if not source_db or not target_db:
+                return self._fail("源数据库和目标数据库不能为空", "ERR_PARAM_REQUIRED")
+            if not self._validate_mysql_scope_name(source_db) or not self._validate_mysql_scope_name(target_db):
+                return self._fail("库名只能含字母/数字/下划线/-/$", "ERR_PARAM_INVALID")
+            normalized.append({"source_db": source_db, "target_db": target_db})
+
+        conflicts = self._collect_target_db_conflicts(normalized, exclude_source_id=exclude_source_id)
+        return self._ok(
+            {
+                "ok": len(conflicts) == 0,
+                "conflicts": conflicts,
+                "checked_count": len(normalized),
+                "exclude_source_id": exclude_source_id,
+            },
+            "未发现目标库冲突" if not conflicts else "检测到目标库冲突，请调整目标库名",
+            "TARGET_DB_CONFLICTS_OK" if not conflicts else "TARGET_DB_CONFLICTS_FOUND",
+        )
+
     def remove_source(self, get):
         if not hasattr(get, "source_id"):
             return self._fail("缺少参数: source_id", "ERR_PARAM_REQUIRED")
@@ -3690,6 +3946,15 @@ class mysql_multi_source_main:
         data = self._load_config()
         existing_source = self._find_source(data, source_id)
         source_existed = bool(existing_source)
+        conflicts = self._collect_target_db_conflicts(normalized, exclude_source_id=source_id if source_existed else "")
+        if conflicts:
+            return self._fail(
+                "目标库名存在冲突，请先调整后再继续",
+                "ERR_TARGET_DB_CONFLICT",
+                {"conflicts": conflicts},
+            )
+
+        previous_source_snapshot = copy.deepcopy(existing_source) if existing_source else None
         if existing_source:
             existing_source["master_host"] = str(getattr(get, "master_host")).strip()
             existing_source["master_port"] = int(getattr(get, "master_port"))
@@ -3718,8 +3983,18 @@ class mysql_multi_source_main:
             "mappings": json.dumps(normalized),
         }))
         if not map_resp.get("status"):
-            # rollback best-effort
-            self.remove_source(public.to_dict_obj({"source_id": source_id}))
+            # Existing sources must never be deleted as a rollback side effect.
+            if source_existed:
+                latest = self._load_config()
+                live_source = self._find_source(latest, source_id)
+                if live_source and previous_source_snapshot:
+                    live_source.clear()
+                    live_source.update(previous_source_snapshot)
+                    live_source["updated_at"] = self._now()
+                    self._save_config(latest)
+                    self._append_log(source_id, "重复接入流程失败，已恢复原连接配置")
+            else:
+                self.remove_source(public.to_dict_obj({"source_id": source_id}))
             return map_resp
 
         mode = (str(getattr(get, "mode", "auto")) or "auto").strip().lower()
