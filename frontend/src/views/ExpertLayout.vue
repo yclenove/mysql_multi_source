@@ -14,6 +14,79 @@ const lastResponse = ref<any>(null)
 const lastMethod = ref('')
 const lastLabel = ref('')
 
+const resultFieldLabels: Record<string, string> = {
+  source_id: '来源 ID',
+  channel_name: '通道名',
+  task_id: '任务 ID',
+  worker_id: 'Worker ID',
+  mode: '模式',
+  effective_mode: '实际模式',
+  status: '状态',
+  current_step: '当前步骤',
+  progress: '进度',
+  retry_count: '重试次数',
+  max_retry: '最大重试次数',
+  error: '错误信息',
+  error_type: '错误类型',
+  message: '提示信息',
+  code: '错误码',
+  content: '内容',
+  count: '数量',
+  mode_count: '模式数量',
+  running: '运行中来源',
+  stopped: '已停止来源',
+  errors: '异常来源',
+  total_sources: '来源总数',
+  total_tasks: '任务总数',
+  pending_tasks: '待执行任务',
+  live_tasks: '运行中任务',
+  avg_duration: '平均耗时',
+  success_count: '成功数',
+  failed_count: '失败数',
+  recommended_mode: '推荐模式',
+  reason: '原因',
+  enabled: '是否启用',
+  gtid_mode: 'GTID 模式',
+  actions: '修复动作',
+  need_restart: '是否需要重启',
+  restarted: '是否已重启',
+  user: '账号',
+  host: '主机',
+  token: '握手 Token',
+  expires_at: '过期时间',
+  verified: '是否验证通过',
+  profile_id: '配置单 ID',
+  profile_b64: '配置单内容',
+  signature: '签名',
+  tool_name: '工具名',
+  log_path: '日志路径',
+  command: '命令',
+  reachable: '是否可达',
+}
+
+const resultFieldPriority: Record<string, string[]> = {
+  add_source: ['source_id', 'channel_name', 'message', 'code'],
+  set_db_mappings: ['source_id', 'count', 'message', 'code'],
+  create_bootstrap_task: ['task_id', 'source_id', 'channel_name', 'mode', 'status', 'progress', 'current_step'],
+  trigger_bootstrap_task: ['task_id', 'worker_id', 'status', 'current_step', 'progress', 'message'],
+  get_bootstrap_task: ['task_id', 'source_id', 'status', 'current_step', 'progress', 'retry_count', 'error_type', 'error'],
+  get_task_logs: ['task_id', 'content'],
+  overview_metrics: ['total_sources', 'running', 'stopped', 'errors', 'total_tasks', 'pending_tasks', 'live_tasks', 'success_count', 'failed_count', 'avg_duration'],
+  wizard_dashboard_snapshot: ['total_sources', 'running', 'stopped', 'errors', 'live_tasks'],
+  master_health_check: ['status', 'message', 'code'],
+  master_auto_fix_preview: ['need_restart', 'actions'],
+  master_auto_fix_apply: ['message', 'code'],
+  master_create_repl_user: ['user', 'host', 'message', 'code'],
+  check_bootstrap_tools: ['tool_name', 'message', 'code'],
+  get_tool_install_log: ['content'],
+  replica_verify_profile: ['verified', 'message', 'code'],
+  replica_import_profile: ['source_id', 'message', 'code'],
+  master_create_handshake: ['token', 'expires_at'],
+  handshake_status: ['status', 'expires_at', 'message', 'code'],
+  health_check: ['message', 'code'],
+  get_gtid_status: ['gtid_mode', 'enabled'],
+}
+
 const responseStatus = computed<'success' | 'error' | 'info'>(() => {
   if (!lastResponse.value) return 'info'
   return lastResponse.value?.status === true ? 'success' : 'error'
@@ -34,7 +107,24 @@ const responseData = computed(() => {
 const responseEntries = computed(() => {
   const data = responseData.value
   if (!data || Array.isArray(data)) return []
-  return Object.entries(data).slice(0, 12)
+  const method = lastMethod.value
+  const priority = resultFieldPriority[method] || []
+  const seen = new Set<string>()
+  const ordered: Array<[string, any]> = []
+
+  for (const key of priority) {
+    if (key in data) {
+      ordered.push([key, (data as Record<string, any>)[key]])
+      seen.add(key)
+    }
+  }
+
+  for (const [key, value] of Object.entries(data)) {
+    if (seen.has(key)) continue
+    ordered.push([key, value])
+  }
+
+  return ordered.slice(0, 12)
 })
 
 const responseListPreview = computed(() => {
@@ -42,6 +132,50 @@ const responseListPreview = computed(() => {
   if (!Array.isArray(data)) return []
   return data.slice(0, 10)
 })
+
+const responseHighlightCards = computed(() => {
+  const data = responseData.value
+  const method = lastMethod.value
+  if (!data || Array.isArray(data)) return []
+
+  const pick = (...keys: string[]) => keys
+    .filter((key) => key in data)
+    .map((key) => ({ key, label: resultFieldLabels[key] || key, value: formatValue((data as Record<string, any>)[key]) }))
+
+  if (method === 'get_bootstrap_task') {
+    return pick('task_id', 'status', 'current_step', 'progress', 'retry_count', 'error_type')
+  }
+  if (method === 'create_bootstrap_task' || method === 'trigger_bootstrap_task') {
+    return pick('task_id', 'source_id', 'status', 'progress', 'worker_id')
+  }
+  if (method === 'overview_metrics' || method === 'wizard_dashboard_snapshot') {
+    return pick('total_sources', 'running', 'stopped', 'errors', 'live_tasks', 'pending_tasks')
+  }
+  if (method === 'master_create_handshake') {
+    return pick('token', 'expires_at')
+  }
+  if (method === 'master_auto_fix_preview') {
+    return pick('need_restart', 'actions')
+  }
+  if (method === 'master_create_repl_user') {
+    return pick('user', 'host')
+  }
+  if (method === 'get_gtid_status') {
+    return pick('gtid_mode', 'enabled')
+  }
+  return []
+})
+
+const responseSectionTitle = computed(() => {
+  if (responseHighlightCards.value.length) return '重点结果'
+  if (responseEntries.value.length) return '结构化摘要'
+  if (responseListPreview.value.length) return '列表预览'
+  return '原始响应'
+})
+
+function getFieldLabel(key: string) {
+  return resultFieldLabels[key] || key
+}
 
 function formatValue(value: any) {
   if (value === null || value === undefined || value === '') return '-'
@@ -376,9 +510,18 @@ const toolOptions = [
         </NDescriptionsItem>
       </NDescriptions>
 
+      <NCard v-if="responseHighlightCards.length" :title="responseSectionTitle" size="small" embedded style="margin-bottom:12px">
+        <div class="mms-expert__cards">
+          <div v-for="item in responseHighlightCards" :key="item.key" class="mms-expert__card">
+            <div class="mms-expert__card-label">{{ item.label }}</div>
+            <pre class="mms-expert__card-value">{{ item.value }}</pre>
+          </div>
+        </div>
+      </NCard>
+
       <NCard v-if="responseEntries.length" title="结构化摘要" size="small" embedded style="margin-bottom:12px">
         <NDescriptions :column="1" size="small" bordered>
-          <NDescriptionsItem v-for="([key, value]) in responseEntries" :key="key" :label="key">
+          <NDescriptionsItem v-for="([key, value]) in responseEntries" :key="key" :label="getFieldLabel(key)">
             <pre class="mms-expert__value">{{ formatValue(value) }}</pre>
           </NDescriptionsItem>
         </NDescriptions>
@@ -419,5 +562,33 @@ const toolOptions = [
   word-break: break-all;
   font-size: 12px;
   line-height: 1.5;
+}
+
+.mms-expert__cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+}
+
+.mms-expert__card {
+  padding: 10px 12px;
+  border: 1px solid #ececf2;
+  border-radius: 8px;
+  background: #fafafe;
+}
+
+.mms-expert__card-label {
+  font-size: 12px;
+  color: #7a7f8c;
+  margin-bottom: 6px;
+}
+
+.mms-expert__card-value {
+  margin: 0;
+  font-size: 13px;
+  color: #1f2430;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 </style>
