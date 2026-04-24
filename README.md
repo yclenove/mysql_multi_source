@@ -236,3 +236,24 @@
 
 - 避免重复接入失败时误删已有来源，降低配置破坏风险
 - 降低多源同名目标库误映射风险，减少用户误操作成本
+
+## 阶段二十七：配置单签名校验补强（已完成）
+
+### 后端
+
+- 修复 `replica_verify_profile` 的签名校验缺失问题：
+  - 现在会显式读取 `signature`
+  - 调用 `_profile_verify(payload, signature)` 做真实验签
+  - 对缺少签名、签名不匹配、payload 非法、配置单过期分别返回明确错误码
+- 由于 `replica_import_profile` 与 `replica_accept_handshake` 都依赖 `replica_verify_profile`，因此配置单导入与握手接收链路一并得到修复
+
+### 前端
+
+- 修复从库向导第 3 步进入第 4 步时的冲突检查竞态：
+  - 改为 `await runConflictCheck()`
+  - 只有确认无冲突后才进入策略页并加载推荐方案
+
+### 价值
+
+- 防止伪造或被篡改的配置单绕过“签名配置文件”链路
+- 避免目标库冲突检查尚未完成时就提前进入下一步

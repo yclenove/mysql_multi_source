@@ -2447,22 +2447,31 @@ class mysql_multi_source_main:
 
     def replica_verify_profile(self, get):
         if not hasattr(get, "profile_b64"):
-            return public.returnMsg(False, "缺少参数: profile_b64")
+            return self._fail("缺少参数: profile_b64", "ERR_PARAM_REQUIRED")
         try:
             raw = base64.b64decode(str(get.profile_b64).encode("utf-8")).decode("utf-8")
             obj = json.loads(raw)
+            if not isinstance(obj, dict):
+                return self._fail("配置单内容不是合法对象", "ERR_PROFILE_FORMAT")
             payload = obj.get("payload", {})
+            signature = str(obj.get("signature", "")).strip()
+            if not isinstance(payload, dict):
+                return self._fail("配置单 payload 格式不正确", "ERR_PROFILE_FORMAT")
             required_keys = ["source_id", "channel_name", "master_host", "master_port", "repl_user", "repl_password"]
             missing = [k for k in required_keys if not payload.get(k)]
             if missing:
-                return public.returnMsg(False, "配置单缺少必要字段: {}".format(", ".join(missing)))
+                return self._fail("配置单缺少必要字段: {}".format(", ".join(missing)), "ERR_PROFILE_FIELDS")
             if int(payload.get("expires_at", 0)) < self._now():
-                return public.returnMsg(False, "配置单已过期，请在主库重新导出")
-            return public.returnMsg(True, {"verified": True, "payload": payload})
+                return self._fail("配置单已过期，请在主库重新导出", "ERR_PROFILE_EXPIRED")
+            if not signature:
+                return self._fail("配置单缺少签名，请重新从主库导出", "ERR_PROFILE_SIGNATURE_MISSING")
+            if not self._profile_verify(payload, signature):
+                return self._fail("配置单签名校验失败，请确认配置单未被篡改并重新导出", "ERR_PROFILE_SIGNATURE")
+            return self._ok({"verified": True, "payload": payload}, "配置单签名校验通过", "PROFILE_VERIFIED")
         except (ValueError, TypeError) as ex:
-            return public.returnMsg(False, "配置单格式错误，请确认粘贴完整: {}".format(ex))
+            return self._fail("配置单格式错误，请确认粘贴完整: {}".format(ex), "ERR_PROFILE_FORMAT")
         except Exception as ex:
-            return public.returnMsg(False, "配置单解析失败: {}".format(ex))
+            return self._fail("配置单解析失败: {}".format(ex), "ERR_PROFILE_PARSE")
 
     def replica_import_profile(self, get):
         verify = self.replica_verify_profile(get)

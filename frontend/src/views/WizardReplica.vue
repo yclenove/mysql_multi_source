@@ -391,9 +391,10 @@ onUnmounted(() => {
   stopSyncWatch()
 })
 
-function goStep(n: number) {
+async function goStep(n: number) {
   if (n === 4) {
-    runConflictCheck()
+    const ok = await runConflictCheck()
+    if (!ok) return
   }
   step.value = n
   if (n === 2) runPreflight()
