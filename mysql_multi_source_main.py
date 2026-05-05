@@ -746,17 +746,13 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
 
         # Stream backup over SSH.
         # NOTE:
-        #   Some environments drop MYSQL_PWD from the remote command context
-        #   (observed as "using password: NO" in /tmp/mms_xb.err). To make the
-        #   physical path deterministic we pass both:
-        #     1) MYSQL_PWD=... env
-        #     2) explicit --password=... argument
-        #   This leaks the secret in process list on the master host during
-        #   execution, but is acceptable for this controlled bootstrap stage.
+        #   Password is passed via MYSQL_PWD environment variable only,
+        #   NOT via --password= argument. This prevents the password from
+        #   appearing in the process list on the master host.
         remote_err_path = "/tmp/mms_xb_{}.err".format(task_id)
         remote_cmd = (
             "MYSQL_PWD={pwd_q} {tool} --backup --stream=xbstream "
-            "--user={user_q} --password={pwd_q} --host=127.0.0.1 --port={port} "
+            "--user={user_q} --host=127.0.0.1 --port={port} "
             "--databases={dbs_q} 2>{err_q}"
         ).format(
             pwd_q=self._shell_quote(pwd),
