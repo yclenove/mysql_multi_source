@@ -6,14 +6,21 @@ import hmac
 import base64
 import hashlib
 import uuid
+import logging
 
 import public
+
+logger = logging.getLogger("mms.crypto")
 
 try:
     from cryptography.fernet import Fernet
     _HAS_FERNET = True
 except Exception:
     _HAS_FERNET = False
+    logger.warning(
+        "未检测到 cryptography 库，密码加密功能不可用。"
+        "请安装: pip install cryptography"
+    )
 
 
 class CryptoMixin(object):
@@ -42,16 +49,15 @@ class CryptoMixin(object):
         text = str(plaintext)
         if text.startswith(self.CRYPTO_PREFIX):
             return text
-        if _HAS_FERNET:
-            try:
-                token = Fernet(self._crypto_key()).encrypt(text.encode("utf-8")).decode("utf-8")
-                return self.CRYPTO_PREFIX + token
-            except Exception:
-                pass
-        key = hashlib.sha256(self._crypto_key()).digest()
-        raw = text.encode("utf-8")
-        out = bytes(b ^ key[i % len(key)] for i, b in enumerate(raw))
-        return self.CRYPTO_PREFIX + "xor:" + base64.urlsafe_b64encode(out).decode("utf-8")
+        if not _HAS_FERNET:
+            raise RuntimeError(
+                "加密失败：未安装 cryptography 库，请执行 pip install cryptography"
+            )
+        try:
+            token = Fernet(self._crypto_key()).encrypt(text.encode("utf-8")).decode("utf-8")
+            return self.CRYPTO_PREFIX + token
+        except Exception as ex:
+            raise RuntimeError("加密失败: {}".format(ex))
 
     def _crypto_decrypt(self, value):
         if value is None or value == "":
