@@ -104,10 +104,24 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
     def _with_lock(self):
         self._ensure_dirs()
         fp = None
+        lock_type = None  # "fcntl" or "msvcrt"
         if _fcntl is not None:
             try:
                 fp = open(self.config_lock_path, "a+")
                 _fcntl.flock(fp.fileno(), _fcntl.LOCK_EX)
+                lock_type = "fcntl"
+            except Exception:
+                fp = None
+        else:
+            # Windows fallback: msvcrt.locking
+            try:
+                import msvcrt
+                fp = open(self.config_lock_path, "a+")
+                msvcrt.locking(fp.fileno(), msvcrt.LK_LOCK, 1)
+                lock_type = "msvcrt"
+            except ImportError:
+                logger.warning("无可用文件锁机制（无 fcntl/msvcrt），并发写入可能损坏配置")
+                fp = None
             except Exception:
                 fp = None
         try:
@@ -115,7 +129,11 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
         finally:
             if fp is not None:
                 try:
-                    _fcntl.flock(fp.fileno(), _fcntl.LOCK_UN)
+                    if lock_type == "fcntl":
+                        _fcntl.flock(fp.fileno(), _fcntl.LOCK_UN)
+                    elif lock_type == "msvcrt":
+                        import msvcrt
+                        msvcrt.locking(fp.fileno(), msvcrt.LK_UNLCK, 1)
                 except Exception:
                     pass
                 try:
