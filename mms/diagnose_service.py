@@ -32,11 +32,11 @@ class DiagnoseServiceMixin(object):
 
     def diagnose_source(self, get):
         if not hasattr(get, "source_id"):
-            return public.returnMsg(False, "missing parameter: source_id")
+            return self._fail("缺少参数: source_id", "ERR_PARAM_REQUIRED")
         data = self._load_config()
         source = self._find_source(data, str(get.source_id).strip())
         if not source:
-            return public.returnMsg(False, "source not found")
+            return self._fail("未找到该数据源", "ERR_NOT_FOUND")
 
         status = self._get_source_status(source.get("channel_name"))
         network_ok = self.test_source_connection(get).get("status", False)
@@ -53,8 +53,7 @@ class DiagnoseServiceMixin(object):
         if not suggestions:
             suggestions.append("当前状态正常，可继续观察复制延迟")
 
-        return public.returnMsg(
-            True,
+        return self._ok(
             {
                 "source_id": source.get("source_id"),
                 "channel_name": source.get("channel_name"),
@@ -63,6 +62,8 @@ class DiagnoseServiceMixin(object):
                 "gtid_enabled": gtid_info.get("enabled", False),
                 "suggestions": suggestions,
             },
+            "诊断完成",
+            "DIAGNOSE_SOURCE_OK",
         )
 
     def wizard_diagnose_all(self, get=None):

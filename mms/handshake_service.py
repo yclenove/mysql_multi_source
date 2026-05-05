@@ -12,7 +12,7 @@ class HandshakeServiceMixin(object):
         required = ["source_id", "channel_name", "master_host", "master_port", "repl_user", "repl_password"]
         for k in required:
             if not hasattr(get, k):
-                return public.returnMsg(False, "缺少参数: {}".format(k))
+                return self._fail("缺少参数: {}".format(k), "ERR_PARAM_REQUIRED")
         ttl = int(get.ttl_seconds) if hasattr(get, "ttl_seconds") and str(get.ttl_seconds).strip().isdigit() else 3600
         raw_password = str(get.repl_password).strip()
         encrypted_password = self._crypto_encrypt(raw_password)
@@ -35,17 +35,17 @@ class HandshakeServiceMixin(object):
         self._audit(data, "master_export_signed_profile", {"profile_id": profile_id, "source_id": payload["source_id"]})
         self._save_config(data)
         encoded = base64.b64encode(json.dumps(wrapped, ensure_ascii=False).encode("utf-8")).decode("utf-8")
-        return public.returnMsg(True, {"profile_id": profile_id, "profile_b64": encoded, "signature": signature})
+        return self._ok({"profile_id": profile_id, "profile_b64": encoded, "signature": signature}, "配置单导出成功", "PROFILE_EXPORTED")
 
     def master_get_profile(self, get):
         if not hasattr(get, "profile_id"):
-            return public.returnMsg(False, "缺少参数: profile_id")
+            return self._fail("缺少参数: profile_id", "ERR_PARAM_REQUIRED")
         data = self._load_config()
         pid = str(get.profile_id).strip()
         for p in data.get("master_profiles", []):
             if p.get("profile_id") == pid:
-                return public.returnMsg(True, p)
-        return public.returnMsg(False, "未找到该配置单")
+                return self._ok(p, "配置单获取成功", "PROFILE_OK")
+        return self._fail("未找到该配置单", "ERR_NOT_FOUND")
 
     def replica_verify_profile(self, get):
         if not hasattr(get, "profile_b64"):

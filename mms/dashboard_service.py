@@ -17,11 +17,11 @@ class DashboardServiceMixin(object):
         plain = self._crypto_decrypt(result.get("repl_password", ""))
         result["repl_password"] = self._mask_secret(plain)
         result["has_password"] = bool(plain)
-        return public.returnMsg(True, result)
+        return self._ok(result, "数据源详情获取成功", "SOURCE_DETAIL_OK")
 
     def get_source_logs(self, get):
         if not hasattr(get, "source_id"):
-            return public.returnMsg(False, "missing parameter: source_id")
+            return self._fail("缺少参数: source_id", "ERR_PARAM_REQUIRED")
         source_id = str(get.source_id).strip()
         log_path = os.path.join(self.log_dir, "{}.log".format(source_id))
         if not os.path.exists(log_path):
@@ -38,7 +38,7 @@ class DashboardServiceMixin(object):
 
     def get_task_logs(self, get):
         if not hasattr(get, "task_id"):
-            return public.returnMsg(False, "missing parameter: task_id")
+            return self._fail("缺少参数: task_id", "ERR_PARAM_REQUIRED")
         task_id = str(get.task_id).strip()
         log_path = os.path.join(self.log_dir, "task_{}.log".format(task_id))
         if not os.path.exists(log_path):
@@ -74,8 +74,7 @@ class DashboardServiceMixin(object):
         avg_duration = 0
         if done_tasks:
             avg_duration = int(sum([int(t.get("duration_seconds", 0) or 0) for t in done_tasks]) / len(done_tasks))
-        return public.returnMsg(
-            True,
+        return self._ok(
             {
                 "total_sources": total,
                 "running_sources": running,
@@ -86,6 +85,8 @@ class DashboardServiceMixin(object):
                 "bootstrap_failed": len(failed_tasks),
                 "avg_bootstrap_duration_seconds": avg_duration,
             },
+            "概览指标获取成功",
+            "OVERVIEW_OK",
         )
 
     def _all_slave_status(self):
