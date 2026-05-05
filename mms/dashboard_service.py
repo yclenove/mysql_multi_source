@@ -123,7 +123,7 @@ class DashboardServiceMixin(object):
         }
 
     def wizard_dashboard_snapshot(self, get=None):
-        """Return per-source status + running tasks with one SHOW SLAVE STATUS."""
+        """Return per-source status + running tasks with one SHOW REPLICA STATUS."""
         data = self._load_config()
         sources = data.get("sources", []) or []
         tasks = data.get("bootstrap_tasks", []) or []

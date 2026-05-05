@@ -110,6 +110,7 @@ class DiagnoseServiceMixin(object):
                     "fixable": kind in ("权限问题", "资源不足", "网络问题"),
                 })
 
+        # master health issues → config group
         try:
             mh = self.master_health_check().get("msg", {})
             for item in mh.get("items", []):
