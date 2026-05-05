@@ -8,23 +8,25 @@
 - 提供可观测、可诊断、可恢复的复制管理能力
 - 在大库场景下提供更高效的初始化同步方案
 
-## 当前进度（阶段一骨架）
+## 当前版本：v2.1.0（阶段三十二）
 
-- 已完成插件基础文件：
-  - `info.json`
-  - `install.sh`
-  - `index.html`
-  - `mysql_multi_source_main.py`
-  - `start_sync.py`
-- 已完成基础 API 骨架：
-  - `health_check`
-  - `list_sources`
-  - `add_source`
-  - `remove_source`
-  - `start_channel`（当前为骨架状态切换）
-  - `stop_channel`（当前为骨架状态切换）
-  - `channel_status`
-- 已建立项目规则体系：`.cursor/rules/*.mdc`
+- **安全加固**：GTID SQL 注入防护、配置单密码 Fernet 加密、移除 XOR 加密降级、SSH 密码 stdin pipe
+- **MySQL 8.0.23+ 兼容**：自动检测版本并切换 `CHANGE REPLICATION SOURCE TO` / `START REPLICA` 等新语法
+- **my.cnf 防覆盖**：多源复制配置写入独立 `multi_source.cnf`，通过 `!include` 引入
+- **测试奠基**：236 条 pytest 单元测试，mms/ 模块覆盖率 85%
+- **工程化**：裸 except 分类捕获 Top 10、GitHub Actions CI 流水线（Python 3.8/3.10/3.12）
+
+### 历史版本
+
+<details>
+<summary>v2.0.0（阶段二十一至三十一）— 点击展开</summary>
+
+- 完整的多源复制管理能力：多 channel、物理/逻辑双引擎初始化、向导编排
+- Vue3 + Vite + Naive UI 前端重写
+- 主库协同：健康检测、自动修复、握手会话、签名配置
+- 后端模块化拆分首批（mms/ 包）
+- 详见下方各阶段进展记录
+</details>
 
 ## 文档索引
 
