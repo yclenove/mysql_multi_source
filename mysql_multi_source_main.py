@@ -123,6 +123,25 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
                 except Exception:
                     pass
 
+    # === SSH host key verification ===
+
+    def _get_ssh_strict_mode(self):
+        """Get SSH StrictHostKeyChecking mode from config.
+
+        Returns:
+            str: "accept-new" (default), "yes", or "no"
+        """
+        try:
+            data = self._load_config()
+            mode = str(data.get("ssh_strict_host_key", "accept-new") or "accept-new").strip().lower()
+            if mode not in ("accept-new", "yes", "no"):
+                mode = "accept-new"
+        except Exception:
+            mode = "accept-new"
+        if mode == "no":
+            logger.warning("SSH 主机密钥验证已禁用，存在 MITM 风险")
+        return mode
+
     # === subprocess: run shell with env, no password in argv ===
 
     def _run_shell(self, cmd, env_extra=None, timeout=1800, cwd=None, shell=False):
@@ -645,9 +664,11 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
 
         # SSH preflight; use BatchMode=yes so missing keys fail fast
         ssh_user = "root"
+        ssh_strict = self._get_ssh_strict_mode()
         preflight = self._run_shell(
             [
-                "ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                "ssh", "-o", "BatchMode=yes",
+                "-o", "StrictHostKeyChecking={}".format(ssh_strict),
                 "-o", "ConnectTimeout=5",
                 "{}@{}".format(ssh_user, source_host),
                 "command -v {} || echo NO_TOOL".format(tool),
@@ -682,7 +703,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
             try:
                 rv = self._run_shell(
                     [
-                        "ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                        "ssh", "-o", "BatchMode=yes",
+                        "-o", "StrictHostKeyChecking={}".format(ssh_strict),
                         "{}@{}".format(ssh_user, source_host),
                         "mysql -Nse \"SELECT @@version\" 2>/dev/null || true",
                     ],
@@ -695,7 +717,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
             try:
                 rv = self._run_shell(
                     [
-                        "ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                        "ssh", "-o", "BatchMode=yes",
+                        "-o", "StrictHostKeyChecking={}".format(ssh_strict),
                         "{}@{}".format(ssh_user, source_host),
                         "{} --version 2>/dev/null".format(tool),
                     ],
@@ -771,7 +794,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
             dbs_q=self._shell_quote(dbs_list),
             err_q=self._shell_quote(remote_err_path),
         )
-        pipeline = "ssh -o BatchMode=yes -o StrictHostKeyChecking=no {tgt} {remote} | xbstream -x -C {dir}".format(
+        pipeline = "ssh -o BatchMode=yes -o StrictHostKeyChecking={strict} {tgt} {remote} | xbstream -x -C {dir}".format(
+            strict=ssh_strict,
             tgt=self._shell_quote("{}@{}".format(ssh_user, source_host)),
             remote=self._shell_quote(remote_cmd),
             dir=self._shell_quote(backup_dir),
@@ -820,7 +844,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
                 try:
                     remote_err = self._run_shell(
                         [
-                            "ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                            "ssh", "-o", "BatchMode=yes",
+                            "-o", "StrictHostKeyChecking={}".format(ssh_strict),
                             "{}@{}".format(ssh_user, source_host),
                             "tail -n 80 {} 2>/dev/null || echo '(主库无 {})'".format(
                                 self._shell_quote(remote_err_path),
@@ -2114,11 +2139,12 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
         except Exception:
             pass
 
+        ssh_strict = self._get_ssh_strict_mode()
         r = self._run_shell(
             [
                 "ssh",
                 "-o", "BatchMode=yes",
-                "-o", "StrictHostKeyChecking=no",
+                "-o", "StrictHostKeyChecking={}".format(ssh_strict),
                 "-o", "UserKnownHostsFile=/dev/null",
                 "-o", "GlobalKnownHostsFile=/dev/null",
                 "-o", "LogLevel=ERROR",
