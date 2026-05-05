@@ -1,5 +1,39 @@
 # Changelog
 
+## v2.2.0（阶段三十三）— 工程化收尾与代码清洁
+
+### 兼容性收尾
+
+- `_all_slave_status()` 改用 `_replication_sql("SHOW_STATUS_ALL")` 适配函数，消除硬编码 `SHOW SLAVE STATUS`
+- MySQL 8.4 LTS 不再触发无效异常，dashboard/diagnose/wizard 全链路自动受益
+
+### 代码清洁
+
+- 消除主文件与 mixin 的 3 处方法重复定义（`wizard_dashboard_snapshot`/`wizard_diagnose_all`/`wizard_quick_fix`），净减 162 行
+- 裸 `except Exception` 从 70 处降至 26 处（降 63%），全部改为具体异常类型 + 结构化日志
+- mms/ 模块统一使用 `_ok/_fail` 结构化返回（保留纯字符串日志接口不动）
+
+### SSH 安全
+
+- `StrictHostKeyChecking=no` 改为配置化 `ssh_strict_host_key`，默认 `accept-new`
+- 首次连接自动接受主机密钥，后续连接验证已知主机，消除中间人攻击风险
+
+### 测试加固
+
+- diagnose_service 测试覆盖率从 34% 提升至 100%（+28 条用例）
+- 总测试数：267 条，全部通过
+
+### 跨平台
+
+- `_with_lock` 增加 Windows `msvcrt` 文件锁支持，Windows 下配置文件并发写入受保护
+
+### 向后兼容性
+
+- 无 breaking change，升级无需人工干预
+- SSH 配置新增 `ssh_strict_host_key` 选项，不设置时使用安全默认值
+
+---
+
 ## v2.1.0（阶段三十二）— 安全加固与 MySQL 兼容性
 
 ### 安全加固

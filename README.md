@@ -8,15 +8,26 @@
 - 提供可观测、可诊断、可恢复的复制管理能力
 - 在大库场景下提供更高效的初始化同步方案
 
-## 当前版本：v2.1.0（阶段三十二）
+## 当前版本：v2.2.0（阶段三十三）
 
-- **安全加固**：GTID SQL 注入防护、配置单密码 Fernet 加密、移除 XOR 加密降级、SSH 密码 stdin pipe
-- **MySQL 8.0.23+ 兼容**：自动检测版本并切换 `CHANGE REPLICATION SOURCE TO` / `START REPLICA` 等新语法
-- **my.cnf 防覆盖**：多源复制配置写入独立 `multi_source.cnf`，通过 `!include` 引入
-- **测试奠基**：236 条 pytest 单元测试，mms/ 模块覆盖率 85%
-- **工程化**：裸 except 分类捕获 Top 10、GitHub Actions CI 流水线（Python 3.8/3.10/3.12）
+- **兼容性收尾**：`_all_slave_status` 全部走版本适配函数，MySQL 8.4 LTS 无阻断
+- **代码清洁**：消除主文件与 mixin 的 3 处方法重复（-162 行）、裸 except 从 70 处降至 26 处
+- **SSH 安全**：主机密钥验证改为 `accept-new` 策略（可配置），消除中间人攻击风险
+- **测试加固**：267 条 pytest 测试，diagnose_service 覆盖率 34% → 100%
+- **跨平台**：`_with_lock` 支持 Windows msvcrt 文件锁
+- **接口统一**：mms/ 模块统一使用 `_ok/_fail` 结构化返回
 
 ### 历史版本
+
+<details>
+<summary>v2.1.0（阶段三十二）— 点击展开</summary>
+
+- 安全加固：GTID 注入防护、配置单密码加密、XOR 移除、SSH 密码 stdin pipe
+- MySQL 8.0.23+ 语法自动适配
+- my.cnf include 防覆盖
+- 测试奠基：236 条用例，mms/ 覆盖率 85%
+- GitHub Actions CI
+</details>
 
 <details>
 <summary>v2.0.0（阶段二十一至三十一）— 点击展开</summary>
