@@ -89,17 +89,13 @@ class DashboardServiceMixin(object):
         )
 
     def _all_slave_status(self):
-        """Fetch SHOW SLAVE STATUS once and return {channel_name: row}."""
+        """Fetch SHOW REPLICA STATUS once and return {channel_name: row}."""
         out = {}
         try:
-            rows = self._query_sql("SHOW SLAVE STATUS")
+            sql = self._replication_sql("SHOW_STATUS_ALL")
+            rows = self._query_sql(sql)
         except Exception:
             return out
-        if not isinstance(rows, (list, tuple)):
-            try:
-                rows = self._query_sql("SHOW REPLICA STATUS")
-            except Exception:
-                return out
         if not isinstance(rows, (list, tuple)) or not rows:
             return out
         for row in rows:

@@ -141,6 +141,22 @@ class TestReplicationSql:
         sql = replication_sql("SHOW_STATUS", self.V_NEW, channel="ch1")
         assert sql == "SHOW REPLICA STATUS FOR CHANNEL 'ch1'"
 
+    # --- SHOW_STATUS_ALL (no FOR CHANNEL) ---
+    def test_show_status_all_old(self):
+        sql = replication_sql("SHOW_STATUS_ALL", self.V_OLD)
+        assert sql == "SHOW SLAVE STATUS"
+        assert "FOR CHANNEL" not in sql
+
+    def test_show_status_all_new(self):
+        sql = replication_sql("SHOW_STATUS_ALL", self.V_NEW)
+        assert sql == "SHOW REPLICA STATUS"
+        assert "FOR CHANNEL" not in sql
+
+    def test_show_status_all_84(self):
+        sql = replication_sql("SHOW_STATUS_ALL", self.V_84)
+        assert sql == "SHOW REPLICA STATUS"
+        assert "FOR CHANNEL" not in sql
+
     # --- RESET ---
     def test_reset_old(self):
         sql = replication_sql("RESET", self.V_OLD, channel="ch1")

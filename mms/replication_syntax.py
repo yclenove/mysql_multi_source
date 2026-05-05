@@ -58,7 +58,7 @@ def replication_sql(cmd, version, channel=None, host=None, port=None,
 
     Args:
         cmd: 命令类型，支持 "CHANGE_MASTER" | "START" | "STOP" |
-             "SHOW_STATUS" | "RESET"
+             "SHOW_STATUS" | "SHOW_STATUS_ALL" | "RESET"
         version: (major, minor, patch) 元组
         channel: 通道名称（START/STOP/SHOW_STATUS/RESET 必需，
                  CHANGE_MASTER 也需要）
@@ -104,6 +104,10 @@ def replication_sql(cmd, version, channel=None, host=None, port=None,
     elif cmd == "SHOW_STATUS":
         keyword = "REPLICA" if new else "SLAVE"
         return "SHOW {} STATUS FOR CHANNEL '{}'".format(keyword, channel)
+
+    elif cmd == "SHOW_STATUS_ALL":
+        keyword = "REPLICA" if new else "SLAVE"
+        return "SHOW {} STATUS".format(keyword)
 
     elif cmd == "RESET":
         keyword = "REPLICA" if new else "SLAVE"

@@ -85,17 +85,11 @@ class TestAllSlaveStatus:
         result = plugin._all_slave_status()
         assert result == {}
 
-    def test_non_list_fallback(self, plugin):
-        """If SHOW SLAVE STATUS returns non-list, try SHOW REPLICA STATUS."""
-        call_count = {"n": 0}
-        def mock_query(sql):
-            call_count["n"] += 1
-            if call_count["n"] == 1:
-                return "not a list"
-            return [{"Channel_Name": "ch1", "Replica_IO_Running": "Yes", "Replica_SQL_Running": "Yes"}]
-        plugin._query_sql = mock_query
+    def test_non_list_returns_empty(self, plugin):
+        """If _query_sql returns non-list, _all_slave_status returns {}."""
+        plugin._query_sql = lambda sql: "not a list"
         result = plugin._all_slave_status()
-        assert "ch1" in result
+        assert result == {}
 
 
 class TestSourceDetail:
