@@ -16,7 +16,10 @@ import copy
 import shlex
 import subprocess
 import contextlib
+import logging
 import threading
+
+logger = logging.getLogger("mms.main")
 
 if "/www/server/panel/class" not in sys.path:
     sys.path.insert(0, "/www/server/panel/class")
@@ -505,7 +508,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
             existing = public.M("databases").where("name=?", (db_name,)).count()
             if existing and int(existing) > 0:
                 return ""
-        except Exception:
+        except Exception as e:
+            logger.debug("查询数据库注册状态失败: %s", e)
             existing = 0
 
         ps_note = "mysql_multi_source 同步库"
@@ -563,10 +567,11 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
                 try:
                     public.M("databases").insert(slim)
                     return "已写入宝塔数据库列表（最小字段={}）: {}".format(trim, db_name)
-                except Exception:
+                except Exception as e:
+                    logger.debug("写入宝塔数据库列表失败 (trim=%d): %s", trim, e)
                     continue
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("注册数据库 %s 到宝塔面板失败: %s", db_name, e)
         return ""
 
     def _resolve_task_mode(self, task_mode):
@@ -742,8 +747,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
                         f.write(content.encode("utf-8", errors="replace"))
                     else:
                         f.write(content or b"")
-            except Exception:
-                pass
+            except (IOError, OSError) as e:
+                logger.debug("写入备份日志 %s 失败: %s", path, e)
 
         # Stream backup over SSH.
         # NOTE:
@@ -987,7 +992,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
             if val.upper() == "NULL":
                 return ""
             return val
-        except Exception:
+        except Exception as e:
+            logger.debug("查询主库 gtid_executed 失败: %s", e)
             return None
 
     def _run_logical_bootstrap_core(self, source, task, mappings, source_host, source_port,
@@ -1047,7 +1053,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
                     except subprocess.TimeoutExpired:
                         try:
                             size_mb = os.path.getsize(dump_file) / 1024.0 / 1024.0
-                        except Exception:
+                        except (IOError, OSError) as e:
+                            logger.debug("读取备份文件大小失败: %s", e)
                             size_mb = 0.0
                         self._task_step_update(
                             None, task,
@@ -1105,7 +1112,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
                                 first = rows[0]
                                 val = first[0] if not isinstance(first, dict) else list(first.values())[0]
                                 imported_mb = float(val or 0)
-                        except Exception:
+                        except Exception as e:
+                            logger.debug("查询目标库大小失败: %s", e)
                             imported_mb = 0.0
                         elapsed = int(time.time() - import_started)
                         # rough percent: imported DB size vs dump file size.
@@ -1250,8 +1258,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
                 f.write("\n======== 开始安装 {} @ {} ========\n".format(
                     tool_name, time.strftime("%Y-%m-%d %H:%M:%S")
                 ))
-        except Exception:
-            pass
+        except (IOError, OSError) as e:
+            logger.debug("写入安装日志失败: %s", e)
         # Wrap in timeout(300s) so UI never hangs if apt/yum blocks.
         exec_cmd = "timeout 600 bash -lc {} >> \"{}\" 2>&1".format(shlex.quote(cmd), install_log)
         out, err = public.ExecShell(exec_cmd)
@@ -1601,13 +1609,14 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
             try:
                 import shutil
                 shutil.copy2(self.mysql_cnf_path, backup_path)
-            except Exception:
-                pass
+            except (IOError, OSError) as e:
+                logger.warning("备份 my.cnf 失败: %s", e)
 
         # 创建目录（如不存在）
         try:
             os.makedirs(include_dir, exist_ok=True)
-        except Exception:
+        except OSError as e:
+            logger.debug("创建目录 %s 失败，回退到默认路径: %s", include_dir, e)
             # 目录创建失败，fallback 到 my.cnf 同目录
             include_dir = os.path.dirname(self.mysql_cnf_path) or "/etc"
             include_file = os.path.join(include_dir, "multi_source.cnf")
@@ -2584,7 +2593,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
                     first = rows[0]
                     val = first[0] if not isinstance(first, dict) else list(first.values())[0]
                     current_gtid = str(val or "").strip()
-            except Exception:
+            except Exception as e:
+                logger.debug("查询从库 gtid_executed 失败: %s", e)
                 current_gtid = ""
             if not current_gtid:
                 self._append_task_log(
