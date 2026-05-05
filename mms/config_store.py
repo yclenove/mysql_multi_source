@@ -52,6 +52,11 @@ class ConfigStoreMixin(object):
             if pwd and isinstance(pwd, str) and not pwd.startswith(self.CRYPTO_PREFIX):
                 payload["repl_password"] = self._crypto_encrypt(pwd)
                 profile["payload"] = payload
+                # 密码加密后 payload 变更，需同步更新签名，否则导入时验签失败
+                try:
+                    profile["signature"] = self._profile_sign(payload)
+                except Exception:
+                    pass
                 changed = True
 
         if str(data.get("version", "1")) != self.CONFIG_SCHEMA_VERSION:

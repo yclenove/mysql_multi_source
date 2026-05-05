@@ -14,13 +14,15 @@ class HandshakeServiceMixin(object):
             if not hasattr(get, k):
                 return public.returnMsg(False, "缺少参数: {}".format(k))
         ttl = int(get.ttl_seconds) if hasattr(get, "ttl_seconds") and str(get.ttl_seconds).strip().isdigit() else 3600
+        raw_password = str(get.repl_password).strip()
+        encrypted_password = self._crypto_encrypt(raw_password)
         payload = {
             "source_id": str(get.source_id).strip(),
             "channel_name": str(get.channel_name).strip(),
             "master_host": str(get.master_host).strip(),
             "master_port": int(get.master_port),
             "repl_user": str(get.repl_user).strip(),
-            "repl_password": str(get.repl_password).strip(),
+            "repl_password": encrypted_password,
             "db_mappings": json.loads(get.db_mappings) if hasattr(get, "db_mappings") and str(get.db_mappings).strip() else [],
             "created_at": self._now(),
             "expires_at": self._now() + ttl,
