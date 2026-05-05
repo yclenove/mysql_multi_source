@@ -32,6 +32,7 @@ from mms.logging_audit import LoggingAuditMixin
 from mms.handshake_service import HandshakeServiceMixin
 from mms.dashboard_service import DashboardServiceMixin
 from mms.diagnose_service import DiagnoseServiceMixin
+from mms.replication_syntax import ReplicationSyntaxMixin
 
 try:
     # Used to register the target DB into BaoTa's panel SQLite so it shows up
@@ -54,7 +55,7 @@ except Exception:
     _FernetInvalid = Exception
 
 
-class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, LoggingAuditMixin, HandshakeServiceMixin, DashboardServiceMixin, DiagnoseServiceMixin):
+class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, LoggingAuditMixin, HandshakeServiceMixin, DashboardServiceMixin, DiagnoseServiceMixin, ReplicationSyntaxMixin):
     config_path = "/www/server/panel/plugin/mysql_multi_source/multi_source_info.json"
     config_lock_path = "/www/server/panel/plugin/mysql_multi_source/multi_source_info.lock"
     log_dir = "/www/server/panel/plugin/mysql_multi_source/log"
@@ -179,7 +180,7 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
 
     def _get_source_status(self, channel_name):
         safe_channel = self._sql_escape(channel_name)
-        sql = "SHOW SLAVE STATUS FOR CHANNEL '{}'".format(safe_channel)
+        sql = self._replication_sql("SHOW_STATUS", channel=safe_channel)
         try:
             rows = self._query_sql(sql)
             if not rows:
@@ -928,7 +929,7 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
         hb_thread.start()
 
         # Capture master GTID executed position BEFORE the first dump so that
-        # we can later SET @@GLOBAL.gtid_purged and START SLAVE without the
+        # we can later SET @@GLOBAL.gtid_purged and START REPLICA without the
         # replica trying to re-apply historical events. Best-effort: if the
         # capture fails we continue, but replication will likely need manual
         # catchup later.
@@ -2451,7 +2452,7 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
         # best-effort: stop channel before removal (ignore errors)
         if item and self._validate_channel_name(item.get("channel_name", "")):
             try:
-                self._exec_sql("STOP SLAVE FOR CHANNEL '{}'".format(self._sql_escape(item.get("channel_name"))))
+                self._exec_sql(self._replication_sql("STOP", channel=self._sql_escape(item.get("channel_name"))))
             except Exception:
                 pass
 
@@ -2475,8 +2476,9 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
              will not try to re-apply the historical rows we already dumped.
              Important: RESET MASTER is global; we only run it when gtid_executed
              is empty so we never disrupt existing multi-source channels.
-          2. Always run CHANGE MASTER TO + START SLAVE for the channel.
-          3. Refresh source.status from SHOW SLAVE STATUS so the dashboard
+          2. Always run CHANGE REPLICATION SOURCE TO + START REPLICA for the
+             channel (old syntax: CHANGE MASTER TO + START SLAVE).
+          3. Refresh source.status from SHOW REPLICA STATUS so the dashboard
              immediately reflects io_running / sql_running.
         """
         source_id = source.get("source_id")
@@ -2529,27 +2531,21 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
             self._append_task_log(task_id, "[auto-start] 未捕获主库 GTID，跳过 GTID 对齐（可能出现重复事件）")
 
         try:
-            self._exec_sql("STOP SLAVE FOR CHANNEL '{}'".format(safe_channel))
+            self._exec_sql(self._replication_sql("STOP", channel=safe_channel))
         except Exception:
             pass
 
-        change_sql = (
-            "CHANGE MASTER TO MASTER_HOST='{host}', MASTER_PORT={port}, "
-            "MASTER_USER='{user}', MASTER_PASSWORD='{pwd}', MASTER_AUTO_POSITION=1 "
-            "FOR CHANNEL '{channel}'"
-        ).format(
-            host=master_host_s,
-            port=master_port,
-            user=repl_user_s,
-            pwd=repl_pwd_s,
-            channel=safe_channel,
+        change_sql = self._replication_sql(
+            "CHANGE_MASTER", channel=safe_channel,
+            host=master_host_s, port=master_port,
+            user=repl_user_s, pwd=repl_pwd_s,
         )
-        self._append_task_log(task_id, "[auto-start] CHANGE MASTER TO ... FOR CHANNEL '{}'".format(channel_name))
+        self._append_task_log(task_id, "[auto-start] CHANGE REPLICATION SOURCE TO ... FOR CHANNEL '{}'".format(channel_name))
         self._exec_sql(change_sql)
-        self._exec_sql("START SLAVE FOR CHANNEL '{}'".format(safe_channel))
-        self._append_task_log(task_id, "[auto-start] START SLAVE 已发出，开始追数")
+        self._exec_sql(self._replication_sql("START", channel=safe_channel))
+        self._append_task_log(task_id, "[auto-start] START REPLICA 已发出，开始追数")
 
-        # Refresh dashboard state from SHOW SLAVE STATUS
+        # Refresh dashboard state from SHOW REPLICA STATUS
         try:
             status = self._get_source_status(channel_name)
             data = self._load_config()
@@ -2582,24 +2578,18 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
         repl_password = self._sql_escape(plain_pwd)
 
         try:
-            self._exec_sql("STOP SLAVE FOR CHANNEL '{}'".format(safe_channel))
+            self._exec_sql(self._replication_sql("STOP", channel=safe_channel))
         except Exception:
             pass
 
         try:
-            change_sql = (
-                "CHANGE MASTER TO MASTER_HOST='{host}', MASTER_PORT={port}, "
-                "MASTER_USER='{user}', MASTER_PASSWORD='{pwd}', MASTER_AUTO_POSITION=1 "
-                "FOR CHANNEL '{channel}'"
-            ).format(
-                host=master_host,
-                port=master_port,
-                user=repl_user,
-                pwd=repl_password,
-                channel=safe_channel,
+            change_sql = self._replication_sql(
+                "CHANGE_MASTER", channel=safe_channel,
+                host=master_host, port=master_port,
+                user=repl_user, pwd=repl_password,
             )
             self._exec_sql(change_sql)
-            self._exec_sql("START SLAVE FOR CHANNEL '{}'".format(safe_channel))
+            self._exec_sql(self._replication_sql("START", channel=safe_channel))
         except Exception as ex:
             item["status"]["running"] = False
             item["status"]["io_running"] = "No"
@@ -2629,7 +2619,7 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
 
         safe_channel = self._sql_escape(channel_name)
         try:
-            self._exec_sql("STOP SLAVE FOR CHANNEL '{}'".format(safe_channel))
+            self._exec_sql(self._replication_sql("STOP", channel=safe_channel))
         except Exception as ex:
             item["status"]["last_error"] = "停止失败: {}".format(ex)
             item["updated_at"] = self._now()
@@ -2800,8 +2790,9 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
             time.sleep(0.2)
 
             # --- Take over replication: set GTID if captured, then CHANGE
-            # MASTER + START SLAVE automatically so the user doesn't have to
-            # click "启动通道" after the initial data copy completes. -------
+            # REPLICATION SOURCE TO + START REPLICA automatically so the user
+            # doesn't have to click "启动通道" after the initial data copy
+            # completes. -------
             self._task_step_update(data, task, "校验并接管复制", 90)
             channel_start_err = None
             try:
@@ -3541,7 +3532,7 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
         })
 
     def wizard_dashboard_snapshot(self, get=None):
-        """Return per-source status + running tasks with one SHOW SLAVE STATUS."""
+        """Return per-source status + running tasks with one SHOW REPLICA STATUS."""
         data = self._load_config()
         sources = data.get("sources", []) or []
         tasks = data.get("bootstrap_tasks", []) or []
