@@ -1555,23 +1555,98 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
                     actions.append("可选安装物理工具")
         return public.returnMsg(True, {"actions": actions, "need_restart": need_restart})
 
+    def _detect_mycnf_include_dir(self):
+        """探测多源复制独立配置文件的存放目录。
+
+        优先级：
+          1. CentOS/RHEL: /etc/my.cnf.d/
+          2. Ubuntu/Debian: /etc/mysql/conf.d/
+          3. 通用 fallback: 与 my.cnf 同目录下的 conf.d/ 子目录
+
+        Returns:
+            str: 目录路径（不保证已存在）
+        """
+        candidates = [
+            "/etc/my.cnf.d",
+            "/etc/mysql/conf.d",
+        ]
+        for d in candidates:
+            if os.path.isdir(d):
+                return d
+        # fallback: 与 my.cnf 同目录
+        cnf_dir = os.path.dirname(self.mysql_cnf_path) or "/etc"
+        return os.path.join(cnf_dir, "conf.d")
+
     def _apply_master_mycnf_fix(self):
+        """修复 MySQL 配置，将多源复制相关设置写入独立 include 文件。
+
+        多源复制配置（gtid_mode / enforce_gtid_consistency / log_bin /
+        binlog_format）写入独立的 multi_source.cnf，通过 !include 指令
+        引入主 my.cnf。这样宝塔面板操作 my.cnf 时不会覆盖插件配置。
+
+        首次执行时会将现有配置从 my.cnf 迁移到独立文件。
+        """
         content = public.ReadFile(self.mysql_cnf_path) or ""
         if "[mysqld]" not in content:
             content += "\n[mysqld]\n"
-        required = {
-            "gtid_mode": "ON",
-            "enforce_gtid_consistency": "ON",
-            "log_bin": "ON",
-            "binlog_format": "ROW",
-        }
-        updated = content
-        for k, v in required.items():
-            pattern = r"(?m)^{}\s*=.*$".format(re.escape(k))
-            if re.search(pattern, updated):
-                updated = re.sub(pattern, "{}={}".format(k, v), updated)
+
+        # --- 1. 探测 include 目录并写入独立配置文件 ---
+        include_dir = self._detect_mycnf_include_dir()
+        include_file = os.path.join(include_dir, "multi_source.cnf")
+        include_abs = os.path.abspath(include_file)
+
+        # 写入前备份原配置（仅首次）
+        backup_path = self.mysql_cnf_path + ".bak.ms_multi"
+        if not os.path.exists(backup_path):
+            try:
+                import shutil
+                shutil.copy2(self.mysql_cnf_path, backup_path)
+            except Exception:
+                pass
+
+        # 创建目录（如不存在）
+        try:
+            os.makedirs(include_dir, exist_ok=True)
+        except Exception:
+            # 目录创建失败，fallback 到 my.cnf 同目录
+            include_dir = os.path.dirname(self.mysql_cnf_path) or "/etc"
+            include_file = os.path.join(include_dir, "multi_source.cnf")
+            include_abs = os.path.abspath(include_file)
+            try:
+                os.makedirs(include_dir, exist_ok=True)
+            except Exception:
+                pass
+
+        # 构造独立配置文件内容
+        repl_settings = (
+            "# mysql_multi_source 插件自动生成，请勿手动编辑\n"
+            "# 此文件通过 !include 指令引入主 my.cnf\n"
+            "[mysqld]\n"
+            "gtid_mode=ON\n"
+            "enforce_gtid_consistency=ON\n"
+            "log_bin=ON\n"
+            "binlog_format=ROW\n"
+        )
+        public.WriteFile(include_file, repl_settings)
+
+        # --- 2. 确保主 my.cnf 中存在 !include 指令 ---
+        include_directive = "!include {}".format(include_abs)
+        if include_directive not in content:
+            if "[mysqld]" in content:
+                content = content.replace(
+                    "[mysqld]",
+                    "{}\n[mysqld]".format(include_directive),
+                )
             else:
-                updated = updated.replace("[mysqld]", "[mysqld]\n{}={}".format(k, v))
+                content = include_directive + "\n" + content
+
+        # --- 3. 从 my.cnf 迁移：移除已迁移到独立文件的配置项 ---
+        migrated_keys = ["gtid_mode", "enforce_gtid_consistency", "log_bin", "binlog_format"]
+        updated = content
+        for k in migrated_keys:
+            updated = re.sub(r"(?m)^{}\s*=.*\n?".format(re.escape(k)), "", updated)
+
+        # --- 4. 处理 server_id 和 bind-address（仍保留在 my.cnf 中） ---
         if not re.search(r"(?m)^server_id\s*=", updated):
             updated = updated.replace("[mysqld]", "[mysqld]\nserver_id={}".format(int(time.time()) % 100000 + 100))
         bind_pattern = r"(?m)^bind[-_]address\s*=\s*(.*)$"
@@ -1580,7 +1655,13 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
             cur_bind = bind_match.group(1).strip()
             if cur_bind in ("127.0.0.1", "localhost", "::1"):
                 updated = re.sub(bind_pattern, "bind-address=0.0.0.0", updated)
+
+        # --- 5. 写回 my.cnf（如有变更） ---
         if updated != content:
+            public.WriteFile(self.mysql_cnf_path, updated)
+            return True
+        elif include_directive not in (public.ReadFile(self.mysql_cnf_path) or ""):
+            # include 指令是新添加的
             public.WriteFile(self.mysql_cnf_path, updated)
             return True
         return False
