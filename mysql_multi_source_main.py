@@ -592,7 +592,7 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
             return None
         try:
             return int(m.group(1)), int(m.group(2))
-        except Exception:
+        except (ValueError, TypeError):
             return None
 
     def _is_xtrabackup_mysql_compatible(self, xb_ver_text, mysql_ver_text):
@@ -689,7 +689,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
                     timeout=12,
                 )
                 remote_mysql_ver = str(rv.get("stdout") or "").strip()
-            except Exception:
+            except (subprocess.SubprocessError, OSError) as e:
+                logger.debug("获取远程 MySQL 版本失败: %s", e)
                 remote_mysql_ver = ""
             try:
                 rv = self._run_shell(
@@ -702,13 +703,15 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
                 )
                 _s = str(rv.get("stdout") or "").strip()
                 remote_tool_ver = _s.splitlines()[0].strip() if _s else ""
-            except Exception:
+            except (subprocess.SubprocessError, OSError) as e:
+                logger.debug("获取远程工具版本失败: %s", e)
                 remote_tool_ver = ""
             try:
                 lv = self._run_shell([tool, "--version"], timeout=8)
                 _s = str(lv.get("stdout") or "").strip()
                 local_tool_ver = _s.splitlines()[0].strip() if _s else ""
-            except Exception:
+            except (subprocess.SubprocessError, OSError) as e:
+                logger.debug("获取本地工具版本失败: %s", e)
                 local_tool_ver = ""
 
             if remote_mysql_ver:
@@ -801,8 +804,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
                 for fn in files:
                     try:
                         xb_total_mb += os.path.getsize(os.path.join(root_d, fn)) / 1024.0 / 1024.0
-                    except Exception:
-                        pass
+                    except (IOError, OSError) as e:
+                        logger.debug("获取备份文件大小失败: %s", e)
             has_checkpoints = os.path.exists(os.path.join(backup_dir, "xtrabackup_checkpoints"))
             self._append_task_log(
                 task_id,
@@ -827,7 +830,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
                         timeout=12,
                     )
                     remote_tail = (remote_err.get("stdout") or "").strip()
-                except Exception:
+                except (subprocess.SubprocessError, OSError) as e:
+                    logger.debug("读取主库错误日志失败: %s", e)
                     remote_tail = ""
                 if remote_tail:
                     self._append_task_log(task_id, "[physical] 主库 /tmp/mms_xb.err 尾部:\n{}".format(remote_tail))
@@ -927,8 +931,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
                         if t and t.get("status") == "running":
                             t["last_heartbeat"] = self._now()
                     self._update_config(_beat)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("心跳更新失败: %s", e)
                 hb_stop.wait(5)
         hb_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
         hb_thread.start()
@@ -1066,7 +1070,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
                     raise Exception("mysqldump 失败: " + msg)
             try:
                 final_mb = os.path.getsize(dump_file) / 1024.0 / 1024.0
-            except Exception:
+            except (IOError, OSError) as e:
+                logger.debug("获取 dump 文件大小失败: %s", e)
                 final_mb = 0.0
             self._append_task_log(task_id, "mysqldump 完成: {} ({:.2f} MB)".format(source_db, final_mb))
             self._append_log(source_id, "mysqldump: {} -> {} ({:.2f} MB)".format(source_db, dump_file, final_mb))
@@ -1188,8 +1193,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
                 resp = self.trigger_bootstrap_task(public.to_dict_obj({"task_id": tid}))
                 if resp.get("status"):
                     triggered.append(tid)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("触发任务 %s 失败: %s", tid, e)
         return self._ok(
             {
                 "recovered_tasks": len(recovered),
@@ -1453,7 +1458,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
             else:
                 add_item("bind_address", "warn", bind_val, "0.0.0.0 或 *",
                          "MySQL 仅绑定 {}，请确认从库能通过此地址连接".format(bind_val))
-        except Exception:
+        except (OSError, ValueError) as e:
+            logger.warning("检测 bind_address 失败: %s", e)
             add_item("bind_address", "warn", "无法检测", "0.0.0.0", "建议手动确认 my.cnf 中的 bind-address 设置")
 
         try:
@@ -1471,7 +1477,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
             else:
                 add_item("port_listen", "warn", "端口 {} 连接失败".format(port_val), "可访问",
                          "请检查防火墙是否放行 {} 端口".format(port_val))
-        except Exception:
+        except (OSError, ValueError) as e:
+            logger.warning("检测端口监听失败: %s", e)
             add_item("port_listen", "warn", "无法检测", "可访问", "建议手动确认端口是否开放")
 
         check_user = ""
@@ -1539,7 +1546,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
                     add_item("repl_user", "warn",
                              "未发现", "至少一个",
                              "未找到具有复制权限的账号，请在执行修复时创建")
-            except Exception:
+            except Exception as e:
+                logger.warning("检测复制账号失败: %s", e)
                 add_item("repl_user", "warn", "无法检测", "可检查", "建议手动确认复制账号")
 
         return public.returnMsg(True, report)
@@ -1623,8 +1631,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
             include_abs = os.path.abspath(include_file)
             try:
                 os.makedirs(include_dir, exist_ok=True)
-            except Exception:
-                pass
+            except OSError as e:
+                logger.warning("创建目录 %s 失败: %s", include_dir, e)
 
         # 构造独立配置文件内容
         repl_settings = (
@@ -1978,12 +1986,12 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
             srcs = data.get("sources", []) or []
             if srcs:
                 last_sid = srcs[0].get("source_id", "") or ""
-        except Exception:
+        except (AttributeError, IndexError):
             pass
         try:
             import socket as _socket
             hostname = _socket.gethostname()
-        except Exception:
+        except (OSError, socket.error):
             hostname = ""
         replica_ip = ""
         try:
@@ -1993,11 +2001,12 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
             s.connect(("8.8.8.8", 80))
             replica_ip = s.getsockname()[0]
             s.close()
-        except Exception:
+        except (OSError, socket.error) as e:
+            logger.debug("获取从库 IP 失败: %s", e)
             try:
                 import socket as _sock
                 replica_ip = _sock.gethostbyname(_sock.gethostname())
-            except Exception:
+            except (OSError, socket.error):
                 replica_ip = ""
         payload = {
             "type": "mms.handshake.v1",
@@ -2035,7 +2044,7 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
             obj = json.loads(decoded)
             if isinstance(obj, dict) and obj.get("type") == "mms.handshake.v1":
                 parsed = obj
-        except Exception:
+        except (ValueError, json.JSONDecodeError):
             parsed = None
         if parsed:
             pub_key = str(parsed.get("pub_key", "")).strip()
@@ -2061,8 +2070,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
                     data = self._load_config()
                     self._audit(data, "master_import_handshake", meta)
                     self._save_config(data)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("记录审计日志失败: %s", e)
                 return self._ok(body, "握手单已安装，物理模式已开通", "MASTER_HANDSHAKE_INSTALLED")
         return res
 
@@ -2174,7 +2183,7 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
                                 grants.append(str(g.get(first_key, "")))
                         elif isinstance(g, (list, tuple)) and len(g) > 0:
                             grants.append(str(g[0]))
-                except Exception:
+                except (AttributeError, IndexError, TypeError):
                     grants = []
                 result.append({
                     "user": user_txt,
@@ -2302,7 +2311,7 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
             return self._fail("channel_name 仅支持字母、数字、下划线，最长64位", "ERR_PARAM_INVALID")
         try:
             master_port = int(get.master_port)
-        except Exception:
+        except (ValueError, TypeError):
             return self._fail("端口号必须为整数", "ERR_PARAM_INVALID")
         if master_port < 1 or master_port > 65535:
             return self._fail("端口号超出范围（1-65535）", "ERR_PARAM_INVALID")
@@ -2371,7 +2380,7 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
         host = str(get.master_host).strip()
         try:
             port = int(get.master_port)
-        except Exception:
+        except (ValueError, TypeError):
             return self._fail("端口号必须为整数", "ERR_PARAM_INVALID")
         user = str(get.repl_user).strip()
         pwd = str(get.repl_password)
@@ -2484,7 +2493,7 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
         if isinstance(raw_mappings, str):
             try:
                 raw_mappings = json.loads(raw_mappings) if raw_mappings.strip() else []
-            except Exception:
+            except (json.JSONDecodeError, ValueError):
                 return self._fail("mappings 格式非法（需 JSON）", "ERR_PARAM_INVALID")
         if not isinstance(raw_mappings, list):
             return self._fail("mappings 必须为列表格式", "ERR_PARAM_INVALID")
@@ -2543,8 +2552,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
         if item and self._validate_channel_name(item.get("channel_name", "")):
             try:
                 self._exec_sql(self._replication_sql("STOP", channel=self._sql_escape(item.get("channel_name"))))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("停止通道失败（可忽略）: %s", e)
 
         if item:
             self._append_log(source_id, "删除来源")
@@ -2623,8 +2632,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
 
         try:
             self._exec_sql(self._replication_sql("STOP", channel=safe_channel))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("停止通道失败（可忽略）: %s", e)
 
         change_sql = self._replication_sql(
             "CHANGE_MASTER", channel=safe_channel,
@@ -2645,8 +2654,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
                 src_live["status"] = status
                 src_live["updated_at"] = self._now()
                 self._save_config(data)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("更新源状态失败: %s", e)
         self._append_log(source_id, "bootstrap 完成后自动启动 channel")
 
     def start_channel(self, get):
@@ -2670,8 +2679,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
 
         try:
             self._exec_sql(self._replication_sql("STOP", channel=safe_channel))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("停止通道失败（可忽略）: %s", e)
 
         try:
             change_sql = self._replication_sql(
@@ -2847,8 +2856,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
         if flag == "busy":
             try:
                 self._append_task_log(task_id, "worker={} 未抢占到任务（已在其他worker执行）".format(incoming_worker or "-"))
-            except Exception:
-                pass
+            except (IOError, OSError) as e:
+                logger.debug("写入任务日志失败: %s", e)
             return public.returnMsg(False, "任务已被其他worker接管")
         # Re-load so downstream logic has a consistent snapshot.
         data = self._load_config()
@@ -2980,8 +2989,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
                 try:
                     import traceback as _tb
                     self._append_task_log(task_id, "[thread] 失败: {}\n{}".format(ex, _tb.format_exc()[:2000]))
-                except Exception:
-                    pass
+                except (IOError, OSError) as e:
+                    logger.debug("写入失败日志时出错: %s", e)
         try:
             threading.Thread(target=_bg_run, daemon=True).start()
             thread_ok = True
@@ -3008,8 +3017,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
                 try:
                     err_fp.write("\n==== {} spawn by {} ====\n".format(time.strftime("%Y-%m-%d %H:%M:%S"), worker_id).encode("utf-8"))
                     err_fp.flush()
-                except Exception:
-                    pass
+                except (IOError, OSError) as e:
+                    logger.debug("写入 stderr 日志失败: %s", e)
                 subprocess.Popen(
                     [python_bin, launcher, "run_bootstrap_task", task_id, worker_id],
                     stdout=err_fp,
@@ -3122,13 +3131,14 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
                 row = status_map.get(s.get("channel_name") or "", None)
                 if self._map_status_row(row or {}).get("running"):
                     running_sources += 1
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("获取从库状态失败: %s", e)
 
         try:
             tools_resp = self.check_bootstrap_tools()
             tools = tools_resp.get("msg", {}) if isinstance(tools_resp, dict) else {}
-        except Exception:
+        except Exception as e:
+            logger.warning("检测引导工具失败: %s", e)
             tools = {}
 
         gtid_enabled = False
@@ -3139,16 +3149,16 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
                 val = rows[0][1] if not isinstance(rows[0], dict) else rows[0].get("Value", "")
                 gtid_value = str(val)
                 gtid_enabled = gtid_value.upper() == "ON"
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("检测 GTID 模式失败: %s", e)
 
         mysql_version = ""
         try:
             rows = self._query_sql("SELECT VERSION() as v") or []
             if rows:
                 mysql_version = (rows[0].get("v") if isinstance(rows[0], dict) else rows[0][0]) or ""
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("获取 MySQL 版本失败: %s", e)
 
         suggested_mode = data.get("mode", "replica_mode")
         try:
@@ -3156,8 +3166,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
             dm = detect.get("msg", {}) if isinstance(detect, dict) else {}
             if dm.get("suggested_mode"):
                 suggested_mode = dm["suggested_mode"]
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("检测运行模式失败: %s", e)
 
         pending_tasks = len([t for t in tasks if t.get("status") in ("pending", "running")])
 
@@ -3169,8 +3179,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
                 hc_data = hc.get("msg", {}) if isinstance(hc, dict) else {}
                 hc_summary = hc_data.get("summary", {})
                 master_health_ok = hc_summary.get("fail", 1) == 0
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("主库健康检查失败: %s", e)
 
         server_ip = ""
         try:
@@ -3178,19 +3188,20 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
             s.connect(("8.8.8.8", 80))
             server_ip = s.getsockname()[0]
             s.close()
-        except Exception:
+        except (OSError, socket.error) as e:
+            logger.debug("通过 UDP 获取 IP 失败: %s", e)
             try:
                 server_ip = socket.gethostbyname(socket.gethostname())
-            except Exception:
-                pass
+            except (OSError, socket.error) as e2:
+                logger.debug("通过 hostname 获取 IP 失败: %s", e2)
 
         mysql_port = 3306
         try:
             port_rows = self._query_sql("SHOW VARIABLES LIKE 'port'")
             if port_rows:
                 mysql_port = int(port_rows[0][1] if not isinstance(port_rows[0], dict) else port_rows[0].get("Value", 3306))
-        except Exception:
-            pass
+        except (ValueError, TypeError) as e:
+            logger.warning("获取 MySQL 端口失败: %s", e)
 
         return self._ok(
             {
@@ -3245,7 +3256,7 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
         host = str(host).strip()
         try:
             port = int(port_str)
-        except Exception:
+        except (ValueError, TypeError):
             return self._fail("master_port 非法", "ERR_PARAM_INVALID")
         user = str(user).strip()
         pwd = str(pwd)
@@ -3264,12 +3275,12 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
         try:
             sock.connect((host, port))
             result["network"] = {"ok": True, "reason": "TCP 已连通"}
-        except Exception as ex:
+        except (OSError, socket.error) as ex:
             result["network"] = {"ok": False, "reason": self._classify_connectivity_error(ex) + ": " + str(ex)}
         finally:
             try:
                 sock.close()
-            except Exception:
+            except (OSError, socket.error):
                 pass
 
         if result["network"]["ok"] and self._check_command_exists("mysql"):
@@ -3321,7 +3332,7 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
         host = str(host).strip()
         try:
             port = int(port_str)
-        except Exception:
+        except (ValueError, TypeError):
             return self._fail("master_port 非法", "ERR_PARAM_INVALID")
         user = str(user).strip()
 
@@ -3358,7 +3369,7 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
                     continue
                 try:
                     size_mb = float(parts[1]) if len(parts) > 1 else 0.0
-                except Exception:
+                except (ValueError, TypeError):
                     size_mb = 0.0
                 dbs.append({"name": name, "size_mb": round(size_mb, 2)})
         else:
@@ -3386,7 +3397,7 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
         if get is not None and hasattr(get, "size_mb"):
             try:
                 size_mb = float(get.size_mb)
-            except Exception:
+            except (ValueError, TypeError):
                 size_mb = 0.0
 
         tools_resp = self.check_bootstrap_tools()
@@ -3467,7 +3478,8 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
         if isinstance(raw_mappings, str):
             try:
                 raw_mappings = json.loads(raw_mappings) if raw_mappings.strip() else []
-            except Exception:
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning("mappings JSON 解析失败: %s", e)
                 return self._fail("mappings 格式非法（需 JSON）", "ERR_PARAM_INVALID")
         if not isinstance(raw_mappings, list) or not raw_mappings:
             return self._fail("请至少选择一个要同步的库", "ERR_MAPPINGS_EMPTY")
