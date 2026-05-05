@@ -30,6 +30,8 @@ from mms.crypto import CryptoMixin
 from mms.config_store import ConfigStoreMixin
 from mms.logging_audit import LoggingAuditMixin
 from mms.handshake_service import HandshakeServiceMixin
+from mms.dashboard_service import DashboardServiceMixin
+from mms.diagnose_service import DiagnoseServiceMixin
 
 try:
     # Used to register the target DB into BaoTa's panel SQLite so it shows up
@@ -52,7 +54,7 @@ except Exception:
     _FernetInvalid = Exception
 
 
-class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, LoggingAuditMixin, HandshakeServiceMixin):
+class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, LoggingAuditMixin, HandshakeServiceMixin, DashboardServiceMixin, DiagnoseServiceMixin):
     config_path = "/www/server/panel/plugin/mysql_multi_source/multi_source_info.json"
     config_lock_path = "/www/server/panel/plugin/mysql_multi_source/multi_source_info.lock"
     log_dir = "/www/server/panel/plugin/mysql_multi_source/log"
@@ -442,32 +444,6 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
         self._heartbeat_task(latest_task)
         self._save_config(latest)
         self._append_task_log(task_id, "step={} progress={}".format(step, progress))
-
-    def _classify_error(self, err_msg):
-        err = str(err_msg or "").lower()
-        if "access denied" in err or "permission" in err:
-            return "权限问题"
-        if "connection" in err or "timed out" in err or "network" in err:
-            return "网络问题"
-        if "gtid" in err:
-            return "GTID问题"
-        if "duplicate" in err or "conflict" in err:
-            return "数据冲突"
-        if "space" in err or "disk" in err or "memory" in err:
-            return "资源不足"
-        return "未知问题"
-
-    def _classify_connectivity_error(self, err_msg):
-        err = str(err_msg or "").lower()
-        if "timed out" in err:
-            return "网络超时"
-        if "refused" in err:
-            return "端口拒绝"
-        if "no route" in err or "unreachable" in err:
-            return "路由不可达"
-        if "access denied" in err:
-            return "账号或权限错误"
-        return "未知连接错误"
 
     def _simulate_or_exec(self, source_id, cmd, allow_fail=False):
         # 当前插件以编排器为主，默认执行轻量验证命令并保留可替换的真实执行点
@@ -2220,19 +2196,6 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
             result.append(item)
         return public.returnMsg(True, result)
 
-    def source_detail(self, get):
-        if not hasattr(get, "source_id"):
-            return self._fail("缺少参数: source_id", "ERR_PARAM_REQUIRED")
-        data = self._load_config()
-        item = self._find_source(data, str(get.source_id).strip())
-        if not item:
-            return self._fail("未找到该数据源", "ERR_NOT_FOUND")
-        result = dict(item)
-        plain = self._crypto_decrypt(result.get("repl_password", ""))
-        result["repl_password"] = self._mask_secret(plain)
-        result["has_password"] = bool(plain)
-        return public.returnMsg(True, result)
-
     def add_source(self, get):
         required = [
             "source_id",
@@ -2553,6 +2516,10 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
                     self._exec_sql("RESET MASTER")
                 except Exception as ex:
                     self._append_task_log(task_id, "[auto-start] RESET MASTER 失败（忽略）: {}".format(ex))
+                if not self._validate_gtid_set(str(captured_gtid)):
+                    self._append_task_log(task_id, "[auto-start] GTID 格式校验失败，拒绝执行 SET GTID_PURGED")
+                    self._append_log(source_id, "GTID 格式校验失败，疑似注入: {}".format(self._mask_secret(str(captured_gtid))))
+                    raise ValueError("GTID 格式校验失败: {}".format(self._mask_secret(str(captured_gtid))))
                 try:
                     self._exec_sql("SET @@GLOBAL.gtid_purged = '{}'".format(self._sql_escape(str(captured_gtid))))
                 except Exception as ex:
@@ -3061,151 +3028,9 @@ class mysql_multi_source_main(ValidatorsMixin, CryptoMixin, ConfigStoreMixin, Lo
                 return public.returnMsg(True, "任务已取消")
         return public.returnMsg(False, "task not found")
 
-    def diagnose_source(self, get):
-        if not hasattr(get, "source_id"):
-            return public.returnMsg(False, "missing parameter: source_id")
-        data = self._load_config()
-        source = self._find_source(data, str(get.source_id).strip())
-        if not source:
-            return public.returnMsg(False, "source not found")
-
-        status = self._get_source_status(source.get("channel_name"))
-        network_ok = self.test_source_connection(get).get("status", False)
-        gtid_info = self.get_gtid_status().get("msg", {})
-        suggestions = []
-        if not network_ok:
-            suggestions.append("检查主库网络连通性和防火墙白名单")
-        if not gtid_info.get("enabled"):
-            suggestions.append("当前从库 GTID 未开启，建议开启后再使用 GTID 自动定位")
-        if status.get("last_error"):
-            suggestions.append("根据 Last_Error 先处理权限/位点/数据冲突问题")
-        if not source.get("db_mappings"):
-            suggestions.append("建议配置库映射，避免多源同名库冲突")
-        if not suggestions:
-            suggestions.append("当前状态正常，可继续观察复制延迟")
-
-        return public.returnMsg(
-            True,
-            {
-                "source_id": source.get("source_id"),
-                "channel_name": source.get("channel_name"),
-                "status": status,
-                "network_ok": network_ok,
-                "gtid_enabled": gtid_info.get("enabled", False),
-                "suggestions": suggestions,
-            },
-        )
-
-    def get_source_logs(self, get):
-        if not hasattr(get, "source_id"):
-            return public.returnMsg(False, "missing parameter: source_id")
-        source_id = str(get.source_id).strip()
-        log_path = os.path.join(self.log_dir, "{}.log".format(source_id))
-        if not os.path.exists(log_path):
-            return public.returnMsg(True, "")
-        content = public.ReadFile(log_path) or ""
-        keyword = str(get.keyword).strip() if hasattr(get, "keyword") else ""
-        if keyword:
-            filtered = []
-            for line in content.splitlines():
-                if keyword in line:
-                    filtered.append(line)
-            content = "\n".join(filtered)
-        return public.returnMsg(True, content or "")
-
-    def get_task_logs(self, get):
-        if not hasattr(get, "task_id"):
-            return public.returnMsg(False, "missing parameter: task_id")
-        task_id = str(get.task_id).strip()
-        log_path = os.path.join(self.log_dir, "task_{}.log".format(task_id))
-        if not os.path.exists(log_path):
-            return public.returnMsg(True, "")
-        content = public.ReadFile(log_path) or ""
-        keyword = str(get.keyword).strip() if hasattr(get, "keyword") else ""
-        if keyword:
-            filtered = []
-            for line in content.splitlines():
-                if keyword in line:
-                    filtered.append(line)
-            content = "\n".join(filtered)
-        return public.returnMsg(True, content or "")
-
-    def overview_metrics(self, get=None):
-        data = self._load_config()
-        total = len(data.get("sources", []))
-        running = 0
-        stopped = 0
-        errors = 0
-        status_map = self._all_slave_status()
-        for source in data.get("sources", []):
-            status = self._map_status_row(status_map.get(source.get("channel_name") or "", {}) or {})
-            if status.get("running"):
-                running += 1
-            else:
-                stopped += 1
-            if status.get("last_error"):
-                errors += 1
-        tasks = data.get("bootstrap_tasks", [])
-        done_tasks = [t for t in tasks if t.get("status") == "done"]
-        failed_tasks = [t for t in tasks if t.get("status") == "failed"]
-        avg_duration = 0
-        if done_tasks:
-            avg_duration = int(sum([int(t.get("duration_seconds", 0) or 0) for t in done_tasks]) / len(done_tasks))
-        return public.returnMsg(
-            True,
-            {
-                "total_sources": total,
-                "running_sources": running,
-                "stopped_sources": stopped,
-                "error_sources": errors,
-                "bootstrap_tasks": len(tasks),
-                "bootstrap_done": len(done_tasks),
-                "bootstrap_failed": len(failed_tasks),
-                "avg_bootstrap_duration_seconds": avg_duration,
-            },
-        )
-
     # =======================================================================
     # Wizard / orchestrator APIs
     # =======================================================================
-
-    def _all_slave_status(self):
-        """Fetch SHOW SLAVE STATUS once and return {channel_name: row}."""
-        out = {}
-        try:
-            rows = self._query_sql("SHOW SLAVE STATUS")
-        except Exception:
-            return out
-        if not isinstance(rows, (list, tuple)):
-            try:
-                rows = self._query_sql("SHOW REPLICA STATUS")
-            except Exception:
-                return out
-        if not isinstance(rows, (list, tuple)) or not rows:
-            return out
-        for row in rows:
-            if isinstance(row, dict):
-                name = row.get("Channel_Name") or row.get("channel_name") or ""
-                out[str(name)] = row
-        return out
-
-    def _map_status_row(self, row):
-        if not isinstance(row, dict):
-            return {
-                "running": False, "io_running": "No", "sql_running": "No",
-                "seconds_behind": None, "last_error": "",
-            }
-        io_running = row.get("Slave_IO_Running", row.get("Replica_IO_Running", "No"))
-        sql_running = row.get("Slave_SQL_Running", row.get("Replica_SQL_Running", "No"))
-        seconds_behind = row.get("Seconds_Behind_Master", row.get("Seconds_Behind_Source"))
-        last_error = row.get("Last_Error", "") or row.get("Last_IO_Error", "") or row.get("Last_SQL_Error", "")
-        return {
-            "running": io_running == "Yes" and sql_running == "Yes",
-            "io_running": io_running,
-            "sql_running": sql_running,
-            "seconds_behind": seconds_behind,
-            "last_error": last_error,
-        }
 
     def wizard_detect_env(self, get=None):
         """Aggregate identity, tools, GTID and summary counts for landing."""
